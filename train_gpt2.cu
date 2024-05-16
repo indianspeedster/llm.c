@@ -38,6 +38,9 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include <stdio.h>
 #include <stdarg.h>
 #include <string>
+#ifdef BUILD_AMD
+#include "amd_support.h"
+#else
 // GPU / CUDA related
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -48,6 +51,7 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #ifdef MULTI_GPU
 #include <mpi.h>
 #include <nccl.h>
+#endif
 #endif
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
@@ -182,17 +186,25 @@ __device__ void __stcs(floatX* address, floatX value) {
 
 // warp-level reduction for summing values
 __device__ float warpReduceSum(float val) {
+#ifdef BUILD_AMD
+    return warp_reduce_sum(val);
+#else
     for (int offset = 16; offset > 0; offset /= 2) {
         val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
     }
     return val;
+#endif
 }
 // warp-level reduction for finding the maximum value
 __device__ float warpReduceMax(float val) {
+#ifdef BUILD_AMD
+    return warp_reduce_max(val);
+#else
     for (int offset = 16; offset > 0; offset /= 2) {
         val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
     }
     return val;
+#endif
 }
 // requires all 32 threads in the warp to be active, but should work for any block size
 // uses non-dynamic shared memory so every call increases shared memory requirements by 128 bytes
@@ -1360,6 +1372,9 @@ void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,
                      int B, int T, int C, int OC) {
+#ifdef BUILD_AMD
+    return matmul_forward_gfx11(out, inp, weight, bias, B, T, C, OC);
+#endif
     NVTX_RANGE_FN();
     int has_bias = (bias != NULL);
 
@@ -1844,6 +1859,11 @@ void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
     }
     void* acts_memory;
     cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(floatX)));
+#ifdef BUILD_AMD
+    // due to differences in cross lane warp operations on AMD, easiest way to make it work
+    // without bigger changes to kernels is to simply to zero the memory on init
+    cudaCheck(cudaMemset(acts_memory, 0, num_activations * sizeof(floatX)));
+#endif
     char* acts_memory_iterator = (char*)acts_memory;
     for (size_t i = 0; i < n; i++) {
         *(targets[i]) = (floatX*)acts_memory_iterator;
