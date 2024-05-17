@@ -1,3 +1,36 @@
+# llm.c for AMD devices
+This is a fork of [Andrej Karpathy's llm.c](https://github.com/karpathy/llm.c) with support for AMD devices. 
+
+## Performance
+
+With default settings on a single 7900 XTX, a training step is currently at ~79ms, compared to ~97ms for PyTorch nightly (2.4.0.dev20240513), and ~440ms for tinygrad.
+
+For multiple GPU training, on a machine with four 7900 XTX, throughput is at ~210,000 tokens per second. 
+
+## Status
+
+- [x] train_gpt2_fp32 (baseline, minimal changes)
+- [x] train_gpt2 with BF16 (baseline, minimal changes)
+- [x] train_gpt2 with BF16 and multiple GPUs
+- [ ] RDNA3 optimized kernels (in progress)
+- [ ] CDNA3 optimized kernels
+
+## Quick Start (AMD targets)
+
+Install ROCm 6.1.1, checkout the repo, and perform the following steps:
+
+```
+pip install -r requirements.txt
+python prepro_tinyshakespeare.py
+python train_gpt2.py
+make train_gpt2amd
+./train_gpt2amd
+```
+
+---
+[ORIGINAL README]
+---
+
 # llm.c
 
 LLM training in simple, pure C/CUDA. There is no need for 245MB of PyTorch or 107MB of cPython. Training GPT-2 (CPU, fp32) is ~1,000 lines of clean code in the single file [train_gpt2.c](train_gpt2.c), and training it on GPU is ~3,000 lines (adds CUDA kernels) in [train_gpt2.cu](train_gpt2.cu). The code compiles and runs instantly, it exactly matches the PyTorch reference implementation, and currently slightly exceeds the speed of (compiled) PyTorch (with bf16, torch compile, and flash attention). I chose GPT-2 as the first working example because it is the grand-daddy of LLMs, the first time the modern stack was put together.
