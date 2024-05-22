@@ -58,6 +58,8 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include "utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "tokenizer.h"
+// defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
+#include "dataloader.h"
 
 // ----------------------------------------------------------------------------
 // CUDA precision settings
@@ -117,6 +119,9 @@ class NvtxRange {
 #else
 #define MAX_1024_THREADS_BLOCKS 1
 #endif
+
+// WarpSize is not a compile time constant, this allows the compiler to optimize
+#define WARP_SIZE 32U
 
 // cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
 const size_t cublaslt_workspace_size = 32 * 1024 * 1024;
@@ -215,10 +220,10 @@ template<reduction_func_t warp_reduction>
 __device__ float blockReduce(float val, bool final_sync=false, float out_of_bounds=0.0f) {
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
-    __shared__ float shared_val[32];
-    const int lane_id = threadIdx.x % 32;
-    const int warp_id = threadIdx.x / 32;
-    const int num_warps = blockDim.x / 32;
+    __shared__ float shared_val[WARP_SIZE];
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int num_warps = blockDim.x / WARP_SIZE;
 
     float warp_val = warp_reduction(val);
     if (lane_id == 0) { shared_val[warp_id] = warp_val; }
@@ -590,10 +595,9 @@ __global__ void encoder_backward_kernel(floatX* dwte, floatX* dwpe,
 __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
                                     const floatX* __restrict__ bias, int N, int C) {
-    const int warp_size = 32;
-    int lane_id = threadIdx.x % warp_size;
-    int warp_id = threadIdx.x / warp_size;
-    int num_warps = blockDim.x / warp_size;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
 
     int idx = blockIdx.x * num_warps + warp_id;
     if(idx >= N) { return; } // guard
@@ -603,7 +607,7 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __re
 
     // mean
     float sum = 0.0f;
-    for (int i = lane_id; i < C; i += warp_size) {
+    for (int i = lane_id; i < C; i += WARP_SIZE) {
         sum += (float)x[i];
     }
     sum = warpReduceSum(sum);
@@ -614,7 +618,7 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __re
 
     // rstd
     sum = 0.0f;
-    for (int i = lane_id; i < C; i += warp_size) {
+    for (int i = lane_id; i < C; i += WARP_SIZE) {
         float diff = (float)x[i] - m;
         sum += diff * diff;
     }
@@ -626,7 +630,7 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __re
 
     // final normalization and scaling by weight/bias
     floatX* o = out + idx * C;
-    for (int c = lane_id; c < C; c += warp_size) {
+    for (int c = lane_id; c < C; c += WARP_SIZE) {
         // load and store using the .cs "streaming" hint to the compiler,
         // indicating that this data will not be reused soon, and can be streamed through the caches
         // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
@@ -639,8 +643,7 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
                                                const floatX* inp1, const floatX* inp2,
                                                const floatX* weight, const floatX* bias,
                                                int N, int C) {
-    constexpr const int WarpSize = 32;
-    assert(blockDim.x == WarpSize);
+    assert(blockDim.x == WARP_SIZE);
 
     // load weights and biases into shared memory
     // do this before we allow any threads to exit!
@@ -651,8 +654,8 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     x128* s_bias = reinterpret_cast<x128*>(params) + (C / x128::size);
     x128* s_res = reinterpret_cast<x128*>(params) + ((2 + threadIdx.y) * C / x128::size);
 
-    int sidx = (threadIdx.x + WarpSize * threadIdx.y) * x128::size;
-    for(int i = sidx; i < C; i += blockDim.y * WarpSize * x128::size) {
+    int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * x128::size;
+    for(int i = sidx; i < C; i += blockDim.y * WARP_SIZE * x128::size) {
         s_weight[i/x128::size] = load128(weight + i);
         s_bias[i/x128::size] = load128(bias + i);
     }
@@ -669,7 +672,7 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
 
     const float eps = 1e-5f;
     float sum = 0.0f;
-    for(int c = threadIdx.x * x128::size; c < C; c += WarpSize * x128::size) {
+    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
         const x128 in1 = load128cs(inp1 + c);
         const x128 in2 = load128cs(inp2 + c);
         x128 out;
@@ -685,7 +688,7 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     float m = sum / C;
     float v = 0.f;
 
-    for(int c = threadIdx.x * x128::size; c < C; c += WarpSize * x128::size) {
+    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
         const x128 res = s_res[c / x128::size];
         for(int k = 0; k < x128::size; ++k) {
             v += ((float)res[k] - m) * ((float)res[k] - m);
@@ -695,7 +698,7 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     v = warpReduceSum(v) / C;
     float s = rsqrtf(v + eps);
 
-    for(int c = threadIdx.x * x128::size; c < C; c += WarpSize * x128::size) {
+    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
         const x128 res = s_res[c / x128::size];
         const x128 w = s_weight[c / x128::size];
         const x128 b = s_bias[c / x128::size];
@@ -856,9 +859,8 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     }
 }
 
-__global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
+__global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const floatX* inp2) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-    if (idx >= N) { return; }
 
     x128 packed_out;
     x128 packed_inp1 = load128cs(inp1 + idx);
@@ -870,9 +872,8 @@ __global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const f
 }
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
+__global__ void gelu_forward_kernel2(floatX* out, const floatX* inp) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-    if (idx >= N) { return; }
 
     x128 packed_out;
     x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
@@ -886,9 +887,8 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
     store128(out + idx, packed_out);
 }
 
-__global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
+__global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floatX* dout) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-    if (idx >= N) { return; }
 
     x128 packed_dinp;
     x128 packed_inp = load128cs(inp + idx);
@@ -910,7 +910,7 @@ template<typename OutFloat, bool UseAuxBuffer>
 __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
                                              std::bool_constant<UseAuxBuffer>) {
     constexpr const int bdx = 4;
-    constexpr const int bdy = 32 / bdx;
+    constexpr const int bdy = WARP_SIZE / bdx;
     assert(blockDim.x == bdx);
     assert(blockDim.y == bdy);
 
@@ -941,7 +941,7 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
         }
     }
 
-    __shared__ float sub_results[x128::size][32][bdy];
+    __shared__ float sub_results[x128::size][WARP_SIZE][bdy];
 
     // reduce within-warp results
     for (int k = 0; k < x128::size; k++) {
@@ -1000,12 +1000,12 @@ __global__ void __launch_bounds__(512, 3) // todo - any warnings on Turing with 
                                             const floatX* mean, const floatX* rstd,
                                             int B, int T, int C) {
     extern __shared__ float shared[]; // size = 2 * C + 1
-    int warpId = threadIdx.x / warpSize; // warp index within a block
-    int warpsInBlock = blockDim.x / warpSize; //number of warps in block
+    int warpId = threadIdx.x / WARP_SIZE; // warp index within a block
+    int warpsInBlock = blockDim.x / WARP_SIZE; //number of warps in block
     int baseIdx = blockIdx.x * warpsInBlock + warpId;
-    int warpThreadIdx = threadIdx.x % warpSize; // Thread index within the warp
+    int warpThreadIdx = threadIdx.x % WARP_SIZE; // Thread index within the warp
     int warpsInGrid = gridDim.x * warpsInBlock;
-    int C_per_iteration = warpSize * x128::size;
+    int C_per_iteration = WARP_SIZE * x128::size;
     int iterations_C = C / C_per_iteration;
 
     // the first half of shared memory is bias, second is weight
@@ -1033,7 +1033,7 @@ __global__ void __launch_bounds__(512, 3) // todo - any warnings on Turing with 
         // first: two reduce operations
         float dnorm_mean = 0.0f;
         float dnorm_norm_mean = 0.0f;
-        for (int i = warpThreadIdx * x128::size; i < C; i += warpSize * x128::size) {
+        for (int i = warpThreadIdx * x128::size; i < C; i += WARP_SIZE * x128::size) {
             x128 dout128_i   = load128(dout_bt + i);
             x128 inp128_i    = load128(inp_bt  + i);
             x128 weight128_i = load128(weight  + i);
@@ -1065,9 +1065,9 @@ __global__ void __launch_bounds__(512, 3) // todo - any warnings on Turing with 
                 float norm_bti = ((float)inp128[x] - mean_bt) * rstd_bt;
                 float dnorm_i = (float)weight128[x] * dout_i;
                 // gradient contribution to bias (using shared memory friendly index)
-                atomicAdd(&dbias_shared[shared_index + x*warpSize], dout_i);
+                atomicAdd(&dbias_shared[shared_index + x*WARP_SIZE], dout_i);
                 // gradient contribution to weight (using shared memory friendly index)
-                atomicAdd(&dweight_shared[shared_index + x*warpSize], norm_bti * dout_i);
+                atomicAdd(&dweight_shared[shared_index + x*WARP_SIZE], norm_bti * dout_i);
                 // gradient contribution to input
                 float dval = 0.0f;
                 dval += dnorm_i; // term 1
@@ -1107,8 +1107,8 @@ __global__ void __launch_bounds__(512, 3) // todo - any warnings on Turing with 
             x128 dbias128 = load128(dbias + global_index);
             x128 dweight128 = load128(dweight + global_index);
             for (int x = 0; x < x128::size; x++) {
-                float s_db = scratch_dbias[shared_index + x*warpSize];
-                float s_dw = scratch_dweight[shared_index + x*warpSize];
+                float s_db = scratch_dbias[shared_index + x*WARP_SIZE];
+                float s_dw = scratch_dweight[shared_index + x*WARP_SIZE];
                 dbias128[x] = (floatX)(s_db + (float)dbias128[x]);
                 dweight128[x] = (floatX)(s_dw + (float)dweight128[x]);
             }
@@ -1163,11 +1163,12 @@ __device__ float lerp(float start, float end, float weight) {
 template <typename Tp, typename Tg>
 __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
-                              unsigned int seed) {
+                              float grad_scale, unsigned int seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_parameters) { return; }  // guard
+
     // get the gradient, m, and v for this parameter
-    float grad = (float)grads_memory[idx];
+    float grad = grad_scale * (float)grads_memory[idx];
     float m = m_memory[idx];
     float v = v_memory[idx];
     // update the first moment (momentum)
@@ -1190,6 +1191,27 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
     // write the full, float version of the param into our master copy, if we maintain one
     // this will be used in the next update
     if (master_params_memory != NULL) { master_params_memory[idx] = param; }
+}
+
+template<class T>
+__global__ void global_norm_squared_kernel(float* out, const T* data, size_t count) {
+    // we want as few atomics as possible, so each block tries to do
+    // the maximum amount of work (so no fixed chunk, but instead iterating
+    // until we run out of data), and then we reduce inside the block
+    // and finally have just one atomic per block.
+    // out will be updated atomically from all thread blocks. It is a float, so the
+    // atomic op is unproblematic
+    size_t index = threadIdx.x + blockDim.x * blockIdx.x;
+    size_t grid_width = blockDim.x * gridDim.x;
+    float accumulator = 0.f;
+    for(size_t i = index; i < count; i += grid_width) {
+        accumulator += (float)data[i] * (float)data[i];
+    }
+    // warp-level reduce
+    float block_sum = blockReduce<warpReduceSum>(accumulator);
+    if(threadIdx.x == 0) {
+        atomicAdd(out, block_sum);
+    }
 }
 
 struct SoftmaxParams {
@@ -1363,7 +1385,7 @@ void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
     NVTX_RANGE_FN();
     const int block_size = 512;
     const int N = B * T;
-    const int grid_size = CEIL_DIV(N * 32, block_size);
+    const int grid_size = CEIL_DIV(N * WARP_SIZE, block_size);
     layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
@@ -1501,8 +1523,9 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
     NVTX_RANGE_FN();
     const int block_size = 256;
+    assert(N % block_size == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1511,7 +1534,7 @@ void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, flo
                              const floatX* weight, const floatX* bias,
                              int N, int C) {
     const int block_size = 256;
-    int block_y = block_size / 32;
+    int block_y = block_size / WARP_SIZE;
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * C * sizeof(floatX);
 
@@ -1521,7 +1544,7 @@ void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, flo
     auto status = cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaGetLastError();
     if(status == cudaSuccess) {
-        fused_residual_forward_kernel5<<<grid_size, dim3(32, block_y), smem>>>(residual, normed, mean, rstd, inp1, inp2,
+        fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem>>>(residual, normed, mean, rstd, inp1, inp2,
                                                                                weight, bias, N, C);
     } else {
         residual_forward(residual, inp1, inp2, N*C);
@@ -1534,16 +1557,18 @@ void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, flo
 void gelu_forward(floatX* out, const floatX* inp, int N) {
     NVTX_RANGE_FN();
     const int block_size = 512;
+    assert(N % block_size == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp, N);
+    gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp);
     cudaCheck(cudaGetLastError());
 }
 
 void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
     NVTX_RANGE_FN();
     const int block_size = 128;
+    assert(N % block_size == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout, N);
+    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1561,7 +1586,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
 
         const int block_size = deviceProp.maxThreadsPerMultiProcessor == 1536 ? 768 : 1024;
 
-        dim3 block_dim = {4, 8, (unsigned)block_size/32};
+        dim3 block_dim = {4, 8, (unsigned)block_size/WARP_SIZE};
         const int OC_per_warp = block_dim.y * x128::size; // 64 at BF16
         const int grid_size_x = CEIL_DIV(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
         const int grid_size_y = max(1, deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / (block_size * grid_size_x)); // full GPU!
@@ -1668,6 +1693,22 @@ void fused_classifier(Type* logits, Type* losses,
     const int N = B * T;
     const int grid_size = N;
     fused_classifier_kernel5<<<grid_size, block_size, 512>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
+    cudaCheck(cudaGetLastError());
+}
+
+template<typename T>
+void global_norm_squared(float* out, const T* values, size_t count) {
+    const int block_size = 512;
+    // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
+    // having one block less than possible is a tiny performance hit, having
+    // one block too many is catastrophic, since it only can start once all the other
+    // blocks finish. anyway, I think cuda_threads_per_SM should be a multiple of 512
+    // on all gpus, so the division really is going to be exact.
+    const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
+    assert(grid_size > 0);      // gives a better error than letting the call below fail
+    // initialize out with zero
+    cudaCheck(cudaMemset(out, 0, sizeof(float)));
+    global_norm_squared_kernel<<<grid_size, block_size>>>(out, values, count);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2353,7 +2394,7 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 #endif
 }
 
-void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t, MultiGpuConfig* multi_gpu_config) {
+float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_clip, int t, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
     size_t num_parameters = multi_gpu_config->shard_num_parameters;
     floatX* params_memory = (floatX*)model->params_memory + multi_gpu_config->shard_offset;
@@ -2374,15 +2415,34 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         }
     }
 
+    // gradient clipping
+    // repurposing this buffer (which isn't needed now) to write grad norm into it
+    float* grad_norm_squared = (float*)model->acts.output;
+    global_norm_squared(grad_norm_squared, (floatX*)model->grads_memory, model->num_parameters);
+    // transfer the gradient norm to CPU
+    float grad_norm_squared_cpu = 0.0f;
+    cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
+    if(!isfinite(grad_norm_squared_cpu)) {
+        // may happen due to some issue (e.g. overflow?)
+        // TODO: later may want to keep a global counter of instabilities like this
+        printf0("[WARNING]: grad norm is not finite, skipping AdamW update\n");
+        return -1.0f;
+    }
+    float grad_norm_cpu = sqrtf(grad_norm_squared_cpu);
+    float grad_scale = (grad_norm_cpu > grad_clip) ? grad_clip / grad_norm_cpu : 1.0f;
+
+    // AdamW update
     int block_size = 512;
     int num_blocks = CEIL_DIV(num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
     adamw_kernel3<<<num_blocks, block_size>>>(params_memory, model->master_weights, grads_memory,
-                                                              model->m_memory, model->v_memory, num_parameters,
-                                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
+                                              model->m_memory, model->v_memory, num_parameters,
+                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
+                                              grad_scale, seed);
     cudaCheck(cudaGetLastError());
+    return grad_norm_cpu;
 }
 
 void gpt2_multi_gpu_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
@@ -2443,85 +2503,7 @@ void common_free(GPT2 &model) {
 }
 
 #ifndef TESTING
-// if we are TESTING (see test_gpt2.cu), we'll skip the int main below
-// ----------------------------------------------------------------------------
-// data loader lite: returns random batches of data from a file of integers
-
-typedef struct {
-    // Distributed data parallel specifics.
-    // Each worker loads it's own chunk of data.
-    int process_rank;
-    int num_processes;
-    // hyperparameters. use size_t to prevent overflow
-    size_t B;
-    size_t T;
-    // input handling and its state
-    FILE* tokens_file;
-    long file_size;
-    long current_position;
-    // output memory
-    int* batch;
-    int* inputs;
-    int* targets;
-    // convenience variables
-    size_t num_batches;
-} DataLoader;
-
-void dataloader_init(DataLoader *loader, const MultiGpuConfig* multi_gpu_config, const char* filename, size_t B, size_t T) {
-    loader->process_rank = multi_gpu_config->process_rank;
-    loader->num_processes = multi_gpu_config->num_processes;
-    loader->B = B;
-    loader->T = T;
-
-    // open the input file for reading
-    loader->tokens_file = fopenCheck(filename, "rb");
-
-    // determine the file size
-    fseekCheck(loader->tokens_file, 0, SEEK_END);
-    loader->file_size = ftell(loader->tokens_file);
-    fseekCheck(loader->tokens_file, 0, SEEK_SET);
-    if (loader->file_size < (B * T + 1) * sizeof(int)) {
-        printf("Error: file size is too small for the batch size and sequence length\n");
-        exit(EXIT_FAILURE);
-    }
-    loader->current_position = loader->process_rank * B * T * sizeof(int); // start at the beginning
-
-    // allocate space for B*T + 1 integers to store the inputs and targets
-    // Using CUDA CPU pinned memory for faster PCI Express transfers to GPU
-    // See: https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/
-    cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
-    loader->inputs = loader->batch;
-    loader->targets = loader->batch + 1; // targets are shifted by one
-    // note: we definitely want to advance by B * T; That is the "stride" by which we move
-    // the window of tokens. We only load B * T + 1 tokens because our targets are offset by 1
-    loader->num_batches = loader->file_size / (loader->num_processes * B * T * sizeof(int));
-}
-
-void dataloader_reset(DataLoader *loader) {
-    loader->current_position = 0;
-}
-
-void dataloader_next_batch(DataLoader *loader) {
-    NVTX_RANGE_FN();
-    size_t B = loader->B;
-    size_t T = loader->T;
-    // if we are at the end of the file, loop back to the beginning
-    if (loader->current_position + (loader->num_processes * B * T + 1) * sizeof(int) > loader->file_size) {
-        loader->current_position = loader->process_rank * B * T * sizeof(int);
-    }
-    // read the B*T+1 integers from the file into batch
-    fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
-    freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
-    // advance the current position by B*T*num_processes integers
-    // note: the "stride" of tokens by which we move each time is definitely B * T
-    loader->current_position += loader->num_processes * B * T * sizeof(int);
-}
-
-void dataloader_free(DataLoader *loader) {
-    fcloseCheck(loader->tokens_file);
-    cudaFreeHost(loader->batch);
-}
-
+// if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
 // ----------------------------------------------------------------------------
 // sampler: takes probabilities and samples integers from them
 
@@ -2579,13 +2561,11 @@ void logger_free(Logger *logger) {
 // CLI, poor man's argparse
 
 void error_usage() {
-    // default run = debugging run with TinyShakespeare
-    // bigger run = train on TinyStories! e.g. val/sample less often, but sample more tokens, write to logfile
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
-    fprintf(stderr, "Example: ./train_gpt2cu -i data/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -i <string> input dataset prefix (default = data/tiny_shakespeare)\n");
-    fprintf(stderr, "  -e <string> input model filename (default = gpt2_124M_bf16.bin)\n");
+    fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
+    fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
+    fprintf(stderr, "  -e <string> input from model at this filename (default = gpt2_124M_bf16.bin)\n");
     fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
@@ -2610,7 +2590,8 @@ int main(int argc, char *argv[]) {
     multi_gpu_config = multi_gpu_config_init(&argc, &argv);
 
     // read in the (optional) command line arguments
-    const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
+    const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* output_log_file = NULL;
     int B = 4; // batch size
@@ -2627,12 +2608,14 @@ int main(int argc, char *argv[]) {
     int use_master_weights = 1;
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
+    float grad_clip  = 1.0f;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
-        if (argv[i][1] == 'i') { input_dataset_prefix = argv[i+1]; }
+        if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
+        else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
         else if (argv[i][1] == 'o') { output_log_file = argv[i+1]; }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
@@ -2647,21 +2630,27 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'c') { grad_clip = atof(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     // calculate a sensible default for total batch size by assuming no gradient accumulation
     if (total_batch_size == -1) { total_batch_size = B * T * multi_gpu_config.num_processes; }
+    // if we're only overfitting a single batch for debugging, let's overfit the first batch
+    // from val instead of train split, because val is smaller and faster. (train_gpt2.py does the same)
+    if (overfit_single_batch == 1) { train_data_pattern = val_data_pattern; }
     printf0("+-----------------------+----------------------------------------------------+\n");
     printf0("| Parameter             | Value                                              |\n");
     printf0("+-----------------------+----------------------------------------------------+\n");
-    printf0("| input dataset prefix  | %-50s |\n", input_dataset_prefix);
+    printf0("| train data pattern    | %-50s |\n", train_data_pattern);
+    printf0("| val data pattern      | %-50s |\n", val_data_pattern);
     printf0("| output log file       | %-50s |\n", output_log_file == NULL ? "NULL" : output_log_file);
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
     printf0("| learning rate         | %-50e |\n", learning_rate);
+    printf0("| grad_clip             | %-50e |\n", grad_clip);
     printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
     printf0("| val_max_batches       | %-50d |\n", val_max_batches);
@@ -2698,16 +2687,9 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
-    char train_tokens_filename[128], val_tokens_filename[128];
-    assert(strlen(input_dataset_prefix) < 100); // being bit lazy here, make sure we don't overflow
-    // if we're only overfitting a single batch for debugging, let's overfit the first batch
-    // from val instead of train split, because val is smaller and a bit faster
-    const char* train_split = (overfit_single_batch == 1) ? "val" : "train";
-    sprintf(train_tokens_filename, "%s_%s.bin", input_dataset_prefix, train_split);
-    sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, &multi_gpu_config, train_tokens_filename, B, T);
-    dataloader_init(&val_loader, &multi_gpu_config, val_tokens_filename, B, T);
+    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
     int train_num_batches = (max_steps == -1) ? train_loader.num_batches : max_steps; // default = 1 epoch
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
@@ -2846,7 +2828,7 @@ int main(int argc, char *argv[]) {
         model.mean_loss = lossf;
         // update the parameters
         gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
-        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1, &multi_gpu_config);
+        float grad_norm = gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, grad_clip, step+1, &multi_gpu_config);
         gpt2_multi_gpu_gather(&model, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
@@ -2868,8 +2850,8 @@ int main(int argc, char *argv[]) {
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
-        printf0("step %4d/%d: train loss %f (acc %f) (%f ms, %0f tok/s)\n",
-                step + 1, train_num_batches, model.mean_loss, accumulated_loss,
+        printf0("step %4d/%d: train loss %f norm %.4f (%.2f ms, %.0f tok/s)\n",
+                step + 1, train_num_batches, accumulated_loss, grad_norm,
                 time_elapsed_ms, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
 

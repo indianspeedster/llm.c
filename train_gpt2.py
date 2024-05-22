@@ -394,7 +394,7 @@ if __name__ == "__main__":
     # if you'd like to e.g. time the forward pass only, call this script as:
     # python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_bin", type=str, default="data/tiny_shakespeare_val.bin", help="input .bin to train on")
+    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl")
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
@@ -407,6 +407,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
     parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
@@ -494,10 +495,28 @@ if __name__ == "__main__":
 
     # load the tokens
     # note we're using val by default instead of train split just because it is smaller/faster
-    assert os.path.isfile(args.input_bin)
+    if not os.path.isfile(args.input_bin):
+        print0(f"ERROR: input .bin file not found: {args.input_bin}")
+        print0("---> HINT: Try to re-run the data prepro script. these recently moved to dev/data")
+        print0("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        exit(1)
     print0(f"loading cached tokens in {args.input_bin}")
     with open(args.input_bin, "rb") as f:
-        tokens = np.frombuffer(f.read(), dtype=np.int32)
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        if header[0] != 20240520:
+            print0("ERROR: magic number mismatch in the data .bin file!")
+            print0("---> HINT: Are you passing in a correct file with --input_bin?")
+            print0("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+            print0("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+            exit(1)
+        assert header[1] == 1, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+        # convert tokens to int32 because torch can't handle uint16 sad
+        tokens = tokens.astype(np.int32)
+        assert len(tokens) == ntok, "number of tokens read does not match header?"
 
     # np -> tensor, long, on device
     tokens = torch.tensor(tokens)
@@ -552,6 +571,7 @@ if __name__ == "__main__":
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     timings = []
+    norm = -1.0   # dummy value to print in inference-only mode
     for step in range(args.num_iterations):
         t0 = time.time()
 
@@ -575,7 +595,7 @@ if __name__ == "__main__":
             # backward pass
             if not args.inference_only:
                 loss.backward()
-        # todo: grad clip here
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -588,7 +608,7 @@ if __name__ == "__main__":
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
         tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
-        print0(f"iteration {step+1}, loss: {lossf:.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}")
+        print0(f"iteration {step+1}, loss: {lossf:.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}, norm: {norm:.3f}")
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1-t0)
 
