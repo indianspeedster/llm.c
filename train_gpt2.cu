@@ -36,8 +36,11 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 
 #include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <vector>
 #include <algorithm>
 #include <functional>
@@ -2150,6 +2153,31 @@ typedef struct {
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 } GPT2;
 
+void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
+    // write the model to a checkpoint file
+    printf0("Writing model to %s\n", checkpoint_path);
+    FILE *model_file = fopenCheck(checkpoint_path, "wb");
+    // write the header first
+    int model_header[256];
+    model_header[0] = 20240326;
+    assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16);
+    model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5;
+    model_header[2] = model->config.max_seq_len;
+    model_header[3] = model->config.vocab_size;
+    model_header[4] = model->config.num_layers;
+    model_header[5] = model->config.num_heads;
+    model_header[6] = model->config.channels;
+    model_header[7] = model->config.padded_vocab_size;
+    fwrite(model_header, sizeof(int), 256, model_file);
+    // write the parameters
+    void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
+    cudaCheck(cudaMemcpy(params_memory_cpu, model->params_memory, model->num_parameters_bytes, cudaMemcpyDeviceToHost));
+    fwrite(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
+    free(params_memory_cpu);
+    // close file, we're done
+    fcloseCheck(model_file);
+}
+
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     if (PRECISION_MODE == PRECISION_FP16) {
@@ -2207,7 +2235,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
     // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)mallocCheck(model->num_parameters_bytes);
+    void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
     freadCheck(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
@@ -2731,14 +2759,34 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
 
     // AdamW update
     int block_size = 512;
-    int num_blocks = CEIL_DIV(num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
-    adamw_kernel3<<<num_blocks, block_size>>>(params_memory, model->master_weights, grads_memory,
-                                              model->m_memory, model->v_memory, num_parameters,
-                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
-                                              grad_scale, seed);
+
+    // individually call the adamw_kernel3 on all parameter tensors separately
+    floatX* params_memory_iter = params_memory;
+    float* master_weights_iter = model->master_weights;
+    floatX* grads_memory_iter = grads_memory;
+    float* m_memory_iter = (float*)model->m_memory;
+    float* v_memory_iter = (float*)model->v_memory;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        size_t num_parameters = model->param_elements[i];
+        int num_blocks = CEIL_DIV(num_parameters, block_size);
+        // we only want to weight decay the 2D tensors and leave all 1D tensors alone
+        // in particular this also decays the embedding weights, but this is ok:
+        // - the token embeddings are weight shared and participate in the final projection to logits
+        // - the position embeddings actively participate at every forward/backward pass
+        float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+        adamw_kernel3<<<num_blocks, block_size>>>(params_memory_iter, master_weights_iter, grads_memory_iter,
+                                                  m_memory_iter, v_memory_iter, num_parameters,
+                                                  learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, wd,
+                                                  grad_scale, seed);
+        params_memory_iter += num_parameters;
+        if (master_weights_iter != NULL) { master_weights_iter += num_parameters; }
+        grads_memory_iter += num_parameters;
+        m_memory_iter += num_parameters;
+        v_memory_iter += num_parameters;
+    }
     cudaCheck(cudaGetLastError());
     return grad_norm_cpu;
 }
@@ -2755,6 +2803,24 @@ void gpt2_multi_gpu_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
     }
     cudaCheck(cudaGetLastError());
 #endif
+}
+
+float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
+    // estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS
+    // see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+    // TODO this calculation is only valid for an A100: generalize it?
+    int N = model->num_parameters;
+    int L = model->config.num_layers;
+    int H = model->config.num_heads;
+    int Q = model->config.channels / model->config.num_heads;
+    int T = model->seq_len;
+    size_t flops_per_token = (size_t)6 * N + (size_t)12 * L * H * Q * T;
+    size_t flops_per_step = flops_per_token * num_tokens;
+    // express our flops throughput as ratio of A100 bfloat16 peak flops
+    float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
+    float flops_promised = 312e12f; // A100 GPU bfloat16 peak flops is 312 TFLOPS
+    float mfu = flops_achieved / flops_promised;
+    return mfu;
 }
 
 void gpt2_free(GPT2 *model) {
@@ -2830,17 +2896,31 @@ int sample_softmax(const float* logits, int n, float coin) {
 // ----------------------------------------------------------------------------
 // Logger lite, will probably grow/change some over time
 
+void create_dir_if_not_exists(const char *dir) {
+    if (dir == NULL) { return; }
+    struct stat st = {0};
+    if (stat(dir, &st) == -1) {
+        if (mkdir(dir, 0700) == -1) {
+            printf0("ERROR: could not create directory: %s\n", dir);
+            exit(EXIT_FAILURE);
+        }
+        printf0("created directory: %s\n", dir);
+    }
+}
+
 typedef struct {
     FILE *logfile;
     int flush_every; // every how many steps to flush the log
 } Logger;
 
-void logger_init(Logger *logger, const char *filename) {
+void logger_init(Logger *logger, const char *log_dir, int process_rank) {
     logger->flush_every = 10;
     logger->logfile = NULL;
-    // only rank 0 process will log
-    if (filename != NULL && multi_gpu_config.process_rank == 0) {
-        logger->logfile = fopenCheck(filename, "w");
+    if (log_dir != NULL && process_rank == 0) {
+        char output_log_file[512];
+        assert(strlen(log_dir) < 500); // being a bit lazy, can relax later maybe
+        snprintf(output_log_file, 512, "%s/main.log", log_dir);
+        logger->logfile = fopenCheck(output_log_file, "w");
     }
 }
 
@@ -2869,32 +2949,42 @@ void logger_free(Logger *logger) {
 
 // ----------------------------------------------------------------------------
 // CLI, poor man's argparse
+// unclaimed flags lol: k,p,y
 
 void error_usage() {
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
     fprintf(stderr, "Options:\n");
+    // file system input / output
     fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
     fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
     fprintf(stderr, "  -e <string> input from model at this filename (default = gpt2_124M_bf16.bin)\n");
-    fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
+    fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
+    fprintf(stderr, "  -n <int>    write optimization checkpoints every how many steps? (default 0, don't)\n");
+    // token layout for each step of the optimization
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
     fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
+    // workload (number of steps)
+    fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
+    // optimization
     fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
     fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
     fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
     fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
-    fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
+    // evaluation
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
     fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
+    // debugging
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
+    // numerics
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
+    // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: saves memory at cost of speed. (default = 1), 0 = none. 1 = recompute gelu\n");
-    fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -2907,7 +2997,8 @@ int main(int argc, char *argv[]) {
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
-    const char* output_log_file = NULL;
+    const char* output_log_dir = NULL;
+    int checkpoint_every = 0; // write optimization checkpoints every how many steps?
     int B = 4; // batch size
     int T = 1024; // sequence length max
     int total_batch_size = -1; // will be calculated down below later, if not provided
@@ -2935,7 +3026,8 @@ int main(int argc, char *argv[]) {
         if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
-        else if (argv[i][1] == 'o') { output_log_file = argv[i+1]; }
+        else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
+        else if (argv[i][1] == 'n') { checkpoint_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
         else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
@@ -2959,6 +3051,15 @@ int main(int argc, char *argv[]) {
     }
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);
+    if (output_log_dir != NULL) {
+        assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
+    }
+    // check if output_log_dir has a "." in it, because this behavior changed May 24, 2024. take out later
+    if (output_log_dir != NULL && strstr(output_log_dir, ".") != NULL) {
+        fprintf(stderr, "-o (output_log_dir) has a '.', are you specifying a file instead of dir?\n");
+        fprintf(stderr, "(note that this option changed recently, -o used to be file, became dir.)\n");
+        exit(EXIT_FAILURE);
+    }
     // calculate a sensible default for total batch size by assuming no gradient accumulation
     if (total_batch_size == -1) { total_batch_size = B * T * multi_gpu_config.num_processes; }
     // if we're only overfitting a single batch for debugging, let's overfit the first batch
@@ -2969,7 +3070,7 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
     printf0("| train data pattern    | %-50s |\n", train_data_pattern);
     printf0("| val data pattern      | %-50s |\n", val_data_pattern);
-    printf0("| output log file       | %-50s |\n", output_log_file == NULL ? "NULL" : output_log_file);
+    printf0("| output log dir        | %-50s |\n", output_log_dir == NULL ? "NULL" : output_log_dir);
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
@@ -2989,11 +3090,9 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     common_start(override_enable_tf32, false); // common init code for train/test/profile
-
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
                               : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
-
     printf0("| device                | %-50s |\n", deviceProp.name);
     printf0("| precision             | %-50s |\n", precision_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -3071,9 +3170,10 @@ int main(int argc, char *argv[]) {
             B, T, multi_gpu_config.num_processes, total_batch_size);
     printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
 
-    // set up the Logger
+    // set up logging
+    create_dir_if_not_exists(output_log_dir);
     Logger logger;
-    logger_init(&logger, output_log_file);
+    logger_init(&logger, output_log_dir, multi_gpu_config.process_rank);
 
     // set up the Tokenizer
     Tokenizer tokenizer;
@@ -3177,6 +3277,14 @@ int main(int argc, char *argv[]) {
             printf("\n---\n");
         }
 
+        // once in a while checkpoint the optimization state
+        if ((checkpoint_every > 0 && output_log_dir != NULL) &&
+            ((step > 0 && step % checkpoint_every == 0) || last_step)) {
+            char checkpoint_filename[512];
+            snprintf(checkpoint_filename, 512, "%s/model_%08d.bin", output_log_dir, step);
+            gpt2_write_to_checkpoint(&model, checkpoint_filename);
+        }
+
         // bit confusing: we want to make sure to eval and sample on 0th iteration
         // but also after the very last iteration. so we loop for step <= train_num_batches
         // instead of just < train_num_batches (one extra due to <=), only to do
@@ -3241,9 +3349,10 @@ int main(int argc, char *argv[]) {
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
-        printf0("step %4d/%d: train loss %f norm %.4f lr %.2e (%.2f ms, %.0f tok/s)\n",
+        float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
+        printf0("step %4d/%d | train loss %7.4f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% A100 fp16 MFU | %.0f tok/s\n",
                 step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
-                time_elapsed_ms, bias_corrected_ema_tokens_per_second);
+                time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
 
         // disable the profiler after 3 steps of optimization
