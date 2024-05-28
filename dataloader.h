@@ -15,7 +15,7 @@ Implements a medium simple DataLoader for a distributed training setup.
 #include "utils.h"
 
 // ----------------------------------------------------------------------------
-// implementation of glob for Windows is in dev/unistd.h 
+// implementation of glob for Windows is in dev/unistd.h
 #ifndef _WIN32
 #include <glob.h>
 #endif
@@ -39,7 +39,7 @@ typedef struct {
     int64_t current_position;
     uint16_t* buffer; // we fread data from file into this buffer
     // public variables that could be accessed from outside
-    size_t num_batches;
+    size_t num_tokens; // total number of tokens
     int* inputs;  // input tokens into transformer
     int* targets; // target tokens for the transformer
 } DataLoader;
@@ -140,7 +140,7 @@ void dataloader_init(DataLoader *loader,
     loader->buffer = (uint16_t*)malloc((B * T + 1) * sizeof(uint16_t));
     loader->inputs = (int*)malloc(B * T * sizeof(int));
     loader->targets = (int*)malloc(B * T * sizeof(int));
-    loader->num_batches = ntok_total / (num_processes * B * T); // useful to know
+    loader->num_tokens = ntok_total;
 
     // reset the loader, to initialize it
     dataloader_reset(loader);
@@ -401,8 +401,8 @@ int evalloader_stat_losses(EvalLoader *loader, float* losses) {
     // iterate the examples in this batch
     int can_fit_examples = B / ASSUMED_NUM_COMPLETIONS;
     for (int i = 0; i < can_fit_examples; i++) {
-        float min_loss;
-        int min_loss_index;
+        float min_loss = 0.0f;
+        int min_loss_index = -1;
         char active = 0; // is this example active or fully empty?
         // iterate the completions in this example
         for (int b = 0; b < ASSUMED_NUM_COMPLETIONS; b++) {

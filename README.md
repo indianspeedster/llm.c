@@ -37,6 +37,8 @@ LLM training in simple, pure C/CUDA. There is no need for 245MB of PyTorch or 10
 
 Our current goal is to reproduce GPT-2. For an overview of current ongoing work, see the latest [State of the Union](https://github.com/karpathy/llm.c/discussions/344) post.
 
+Update May 28, 2024: A useful recent post may be ["Reproducing GPT-2 (124M) in llm.c in 90 minutes for $20"](https://github.com/karpathy/llm.c/discussions/481) where I detail the steps to go from scratch to reproducing the GPT-2 miniseries for 124M/350M models. The files themselves that show the launch commands are [run124M.sh](run124M.sh) and [run350M.sh](run350M.sh).
+
 I'd like this repo to only maintain C and CUDA code. Ports of this repo to other languages are very welcome, but should be done in separate repos, and then I am happy to link to them below in the "notable forks" section, just like I did in [llama2.c notable forks](https://github.com/karpathy/llama2.c/tree/master?tab=readme-ov-file#notable-forks).
 
 ## quick start (GPU, slow but stable and educational)
@@ -367,33 +369,7 @@ done
 # screen -ls | grep -E "tr[0-3]" | cut -d. -f1 | xargs -I {} screen -X -S {} quit
 ```
 
-This example opens up 4 screen sessions and runs the four commands with different LRs. This writes the log files `stories$i.log` with all the losses, which you can plot as you wish in Python. Here's a quick example script to plot the losses in a Jupyter notebook, obviously can become more sophisticated later:
-
-```python
-import matplotlib.pyplot as plt
-%matplotlib inline
-
-def parse_log(logfile):
-  # look for lines like e.g. "s:100 tel:1.6952", step 100, val 1.6952
-    val_steps, val_losses = [], []
-    with open(logfile, "r") as f:
-        lines = f.readlines()
-    for line in lines:
-        if "tel" in line:
-            parts = line.split()
-            step = parts[0].split(":")[1]
-            loss = parts[1].split(":")[1]
-            val_steps.append(int(step))
-            val_losses.append(float(loss))
-    return val_steps, val_losses
-
-results = [parse_log(f"stories{i}.log") for i in range(0, 4)]
-for i, (val_steps, val_losses) in enumerate(results):
-    plt.plot(val_steps, val_losses, label="run {}".format(i))
-plt.xlabel("steps")
-plt.ylabel("loss")
-plt.legend()
-```
+This example opens up 4 screen sessions and runs the four commands with different LRs. This writes the log files `stories$i.log` with all the losses, which you can plot as you wish in Python. A quick example of how to parse and plot these logfiles is in [dev/vislog.ipynb](dev/vislog.ipynb).
 
 ## repo philosophy
 
