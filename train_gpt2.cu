@@ -273,10 +273,10 @@ struct alignas(16) Packed128 {
         return result;
     }
     __device__ static Packed128 zeros() {
-        return constant(0);
+        return constant(floatX{0.0f});
     }
     __device__ static Packed128 ones() {
-        return constant(1);
+        return constant(floatX{1.0f});
     }
 
     __device__ ElementType& operator[](int index) {
