@@ -32,11 +32,11 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #endif
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
-#include "utils.h"
+#include "llmc/utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
-#include "tokenizer.h"
+#include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
-#include "dataloader.h"
+#include "llmc/dataloader.h"
 
 // ----------------------------------------------------------------------------
 // CUDA utils
