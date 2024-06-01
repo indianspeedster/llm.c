@@ -954,12 +954,12 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp) {
     store128(out + idx, packed_out);
 }
 
-__global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floatX* dout) {
+__global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
 
     x128 packed_dinp;
     x128 packed_inp = load128cs(inp + idx);
-    x128 packed_dout = load128cs(dout + idx);
+    x128 packed_dout = load128(d_in_out + idx);
     for (int k = 0; k < packed_inp.size; ++k) {
         float x = (float)packed_inp[k];
         float cube = 0.044715f * x * x * x;
@@ -970,7 +970,7 @@ __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floa
         float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
         packed_dinp[k] = (floatX)(local_grad * (float)packed_dout[k]);
     }
-    store128(dinp + idx, packed_dinp);
+    store128(d_in_out + idx, packed_dinp);
 }
 
 template<typename OutFloat, bool UseAuxBuffer>
@@ -1762,12 +1762,12 @@ void gelu_forward(floatX* out, const floatX* inp, int N) {
     cudaCheck(cudaGetLastError());
 }
 
-void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
+void gelu_backward_inplace(floatX* d_in_out, const floatX* inp, const int N) {
     NVTX_RANGE_FN();
     const int block_size = 128;
     assert(N % block_size == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout);
+    gelu_backward_inplace_kernel<<<grid_size, block_size>>>(d_in_out, inp);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1889,7 +1889,7 @@ void fused_classifier(Type* logits, Type* losses,
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel5<<<grid_size, block_size, 512>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
+    fused_classifier_kernel5<<<grid_size, block_size>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2034,7 +2034,8 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     size_t NH = config.num_heads;
     size_t C = config.channels;
     act_sizes[0] = B * T * C; // encoded
-    act_sizes[1] = L * B * T * C; // ln1
+    // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
+    act_sizes[1] = (recompute < 2) ? L * B * T * C : B * T * C; // ln1
     act_sizes[2] = L * B * T; // ln1_mean
     act_sizes[3] = L * B * T; // ln1_rstd
     act_sizes[4] = L * B * T * C; // atty
@@ -2046,12 +2047,13 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     #endif
     act_sizes[6] = L * B * T * C; // attproj
     act_sizes[7] = L * B * T * C; // residual2
-    act_sizes[8] = L * B * T * C; // ln2
+    // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
+    act_sizes[8] = (recompute < 2) ? L * B * T * C : B * T * C; // ln2
     act_sizes[9] = L * B * T; // ln2_mean
     act_sizes[10] = L * B * T; // ln2_rstd
     act_sizes[11] = L * B * T * 4*C; // fch
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
-    act_sizes[12] = (recompute == 0) ? L * B * T * 4*C : B * T * 4*C;
+    act_sizes[12] = (recompute < 1) ? L * B * T * 4*C : B * T * 4*C;
     act_sizes[13] = L * B * T * C; // fcproj
     act_sizes[14] = L * B * T * C; // residual3
     act_sizes[15] = B * T * C; // lnf
@@ -2475,18 +2477,18 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         floatX* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = acts.ln1 + l * B * T * C;
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.ln1;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_attproj = acts.attproj + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = acts.ln2 + l * B * T * C;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.ln2;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
-        floatX* l_fch_gelu = (model->recompute == 0) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         floatX* l_fcproj = acts.fcproj + l * B * T * C;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
 
@@ -2512,7 +2514,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
 
         // OK, fusion across blocks.
         if(l+1 != L) {
-            floatX* l_ln1 = acts.ln1 + (l + 1) * B * T * C;
+            floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.ln1;
             floatX* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
             floatX* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
@@ -2630,9 +2632,11 @@ void gpt2_backward(GPT2 *model, int* inputs) {
 
         // get the pointers of the weights for this layer
         floatX* l_ln1w = params.ln1w + l * C;
+        floatX* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_ln2w = params.ln2w + l * C;
+        floatX* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
@@ -2649,17 +2653,17 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
         floatX* dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = acts.ln1 + l * B * T * C;
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.ln1;
         floatX* l_ln1_mean = acts.ln1_mean + l * B * T;
         floatX* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = acts.ln2 + l * B * T * C;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.ln2;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
-        floatX* l_fch_gelu = (model->recompute == 0) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
@@ -2676,7 +2680,11 @@ void gpt2_backward(GPT2 *model, int* inputs) {
             gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C);
-        gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
+        gelu_backward_inplace(dl_bt4c, l_fch, B*T*4*C);
+        if(model->recompute >= 2) {
+            // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
@@ -2693,7 +2701,9 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         floatX* dl_preatt = (floatX*)grads_acts.preatt; // dedicated scratchpad allocation
         attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
         #endif
-
+        if(model->recompute >= 2) {
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        }
         // QKV parameter gradients
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
@@ -2896,8 +2906,8 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->grads_acts_memory));
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
-    cudaFreeHost(model->cpu_losses);
-    cudaFreeHost(model->cpu_losses_fp32);
+    cudaCheck(cudaFreeHost(model->cpu_losses));
+    cudaCheck(cudaFreeHost(model->cpu_losses_fp32));
     free(model->workload_indices);
     free(model->bucket_info);
 }
@@ -2979,8 +2989,9 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
-    loader->current_shard = state_header[30]; // shard of the dataset
-    loader->current_position = *((int64_t*)&state_header[31]); // position in shard
+    int current_shard = state_header[30]; // shard of the dataset
+    int64_t current_position = *((int64_t*)&state_header[31]); // position in shard
+    dataloader_resume(loader, current_shard, current_position);
     // read AdamW m, v (they are all float)
     // also allocate the m, v memory in the model, if it does not yet exist
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
@@ -3035,7 +3046,7 @@ void error_usage() {
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
-    fprintf(stderr, "  -r <int>    recompute: saves memory at cost of speed. (default = 1), 0 = none. 1 = recompute gelu\n");
+    fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
     exit(EXIT_FAILURE);
 }
 
