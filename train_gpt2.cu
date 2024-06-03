@@ -7,6 +7,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string>
+#include <string_view>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <vector>
 #include <algorithm>
@@ -42,6 +44,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/sampler.h"
 // defines: logger_init, logger_log_eval, logger_log_val, logger_log_train
 #include "llmc/logger.h"
+// defines: get_flops_promised
+#include "llmc/mfu.h"
 // ----------------------------------------------------------------------------
 // CUDA precision settings
 
@@ -2167,12 +2171,42 @@ typedef struct {
     floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
     float* cpu_losses_fp32; // same but fp32
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
-    int use_master_weights;
-    int recompute;
+    int use_master_weights; // keep master weights copy in float for optim update? 0|1
+    int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 } GPT2;
+
+void gpt2_init_common(GPT2 *model) {
+    // common inits outside of the model weights
+    // the weights are initialized either in:
+    // - gpt2_build_from_checkpoint() if loading from a checkpoint
+    // - gpt2_build_from_random() if starting from scratch
+    // memory lazily initialized in forward()
+    model->acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+    model->cpu_losses = NULL;
+    model->cpu_losses_fp32 = NULL;
+    // the B,T params are determined and set, fixed on first batch in forward()
+    model->batch_size = 0;
+    model->seq_len = 0;
+    model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
+    // memory lazily initialized in backward()
+    model->grads_memory = NULL;
+    model->grads_acts_memory = NULL;
+    model->workload_indices = NULL; // on cpu, for encoder_backward
+    model->bucket_info = NULL; // on cpu, for encoder_backward
+    // memory lazily initialized in update()
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+    model->master_weights = NULL;
+    // other default settings
+    model->rng_state = 13371337; // used in stochastic rounding
+    model->use_master_weights = 1; // safe default: do keep master weights in fp32
+    model->recompute = 1; // good default: recompute gelu but not layernorm
+}
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     // write the model to a checkpoint file
@@ -2263,25 +2297,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
-    // other inits
-    model->acts_memory = NULL;
-    model->grads_memory = NULL;
-    model->m_memory = NULL;
-    model->v_memory = NULL;
-    model->master_weights = NULL;
-    model->grads_acts_memory = NULL;
-    model->inputs = NULL;
-    model->targets = NULL;
-    model->cpu_losses = NULL;
-    model->cpu_losses_fp32 = NULL;
-    model->workload_indices = NULL;
-    model->bucket_info = NULL;
-    model->batch_size = 0;
-    model->seq_len = 0;
-    model->mean_loss = -1.0f; // -1.0f will designate no loss
-    model->rng_state = 13371337;
-    model->use_master_weights = 1; // keep master weights copy in float for optim update?
-    model->recompute = 1; // default to recompute gelu during backward
+    gpt2_init_common(model);
 }
 
 void gpt2_build_from_random(GPT2 *model, int depth) {
@@ -2370,23 +2386,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
 
-    // other inits and defaults
-    model->acts_memory = NULL;
-    model->grads_memory = NULL;
-    model->m_memory = NULL;
-    model->v_memory = NULL;
-    model->master_weights = NULL;
-    model->grads_acts_memory = NULL;
-    model->inputs = NULL;
-    model->targets = NULL;
-    model->cpu_losses = NULL;
-    model->cpu_losses_fp32 = NULL;
-    model->batch_size = 0;
-    model->seq_len = 0;
-    model->mean_loss = -1.0f; // -1.0f designates no loss
-    model->rng_state = 13371337;
-    model->use_master_weights = 1; // keep master weights copy in float for optim update?
-    model->recompute = 1; // default to recompute gelu during backward
+    gpt2_init_common(model);
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, int grad_accum_steps=1) {
@@ -2904,8 +2904,10 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     size_t flops_per_step = flops_per_token * num_tokens;
     // express our flops throughput as ratio of A100 bfloat16 peak flops
     float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
-    //float flops_promised = 312e12f; // A100 GPU bfloat16 peak flops is 312 TFLOPS
-    float flops_promised = 122e12f; // 7900 XTX GPU bfloat16 peak flops is 312 TFLOPS
+    float flops_promised = get_flops_promised(deviceProp.name, PRECISION_MODE) * 1e12f;
+    if(flops_promised < 0) {
+        return -1.f;   // don't know
+    }
     float mfu = flops_achieved / flops_promised;
     return mfu;
 }
@@ -3177,6 +3179,7 @@ int main(int argc, char *argv[]) {
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
                               : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
     printf0("| device                | %-50s |\n", deviceProp.name);
+    printf0("| TFlops                | %-50.1f |\n", get_flops_promised(deviceProp.name, PRECISION_MODE));
     printf0("| precision             | %-50s |\n", precision_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
@@ -3482,7 +3485,7 @@ int main(int argc, char *argv[]) {
         }
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
         float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% 7900 XTX bf16 MFU | %.0f tok/s\n",
+        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
                 step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
