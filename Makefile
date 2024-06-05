@@ -26,8 +26,10 @@ USE_CUDNN ?= 0
 BUILD_DIR = build
 ifeq ($(OS), Windows_NT)
   $(shell if not exist $(BUILD_DIR) mkdir $(BUILD_DIR))
+  REMOVE_BUILD_OBJECT_FILES := del $(BUILD_DIR)\*.obj
 else
   $(shell mkdir -p $(BUILD_DIR))
+  REMOVE_BUILD_OBJECT_FILES := rm -f $(BUILD_DIR)/*.o
 endif
 
 # Function to check if a file exists in the PATH
@@ -60,16 +62,16 @@ ROCM_PATH ?= /opt/rocm
 AMDGPU_TARGETS ?= $(shell $(ROCM_PATH)/llvm/bin/amdgpu-offload-arch)
 HIPCC := $(shell which hipcc 2>/dev/null)
 HIPIFY := $(shell which hipify-perl 2>/dev/null)
-HIPCC_FLAGS = -O3 -march=native
+HIPCC_FLAGS = -O3 -march=native -I$(BUILD_DIR)/hip
 HIPCC_FLAGS += $(addprefix --offload-arch=,$(AMDGPU_TARGETS))
 HIPCC_LDFLAGS = -lhipblas -lhipblaslt -lamdhip64 -ldevice_gemm_operations -lutility -ldevice_other_operations
-REMOVE_FILES += *.hip
 ifneq ($(NO_MULTI_GPU), 1)
   ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
     HIPCC_FLAGS += -I/usr/lib/x86_64-linux-gnu/openmpi/include -DMULTI_GPU
     HIPCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/ -lmpi -lrccl
   endif
 endif
+AMD_HEADERS = $(addprefix $(BUILD_DIR)/hip/,$(wildcard llmc/*h))
 
 # autodect a lot of various supports on current platform
 $(info ---------------------------------------------)
@@ -97,7 +99,7 @@ else
     NVCC :=
   endif
   CC := cl
-  CFLAGS = /Idev /Zi /nologo /Wall /WX- /diagnostics:column /sdl /O2 /Oi /Ot /GL /D _DEBUG /D _CONSOLE /D _UNICODE /D UNICODE /Gm- /EHsc /MD /GS /Gy /fp:fast /Zc:wchar_t /Zc:forScope /Zc:inline /permissive- \
+  CFLAGS = /Idev /Zi /nologo /W4 /WX- /diagnostics:column /sdl /O2 /Oi /Ot /GL /D _DEBUG /D _CONSOLE /D _UNICODE /D UNICODE /Gm- /EHsc /MD /GS /Gy /fp:fast /Zc:wchar_t /Zc:forScope /Zc:inline /permissive- \
    /external:W3 /Gd /TP /wd4996 /Fd$@.pdb /FC /openmp:llvm
   LDFLAGS :=
   LDLIBS :=
@@ -271,7 +273,7 @@ test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
 $(NVCC_CUDNN): llmc/cudnn_att.cpp
-	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) $(CUDA_OUTPUT_FILE)
+	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) -o $@
 
 train_gpt2cu: train_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
@@ -288,20 +290,28 @@ test_gpt2fp32cu: test_gpt2_fp32.cu
 profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE)
 
-%.hip: %.cu
+### AMD builds:
+
+$(BUILD_DIR)/hip/llmc/%h: llmc/%h
+	@mkdir -p $(dir $@)
 	$(HIPIFY) -quiet-warnings $< -o $@
 
-%amd: %.hip amd_support.h
+amd_headers: $(AMD_HEADERS)
+
+$(BUILD_DIR)/hip/%.cu: %.cu
+	@mkdir -p $(dir $@)
+	$(HIPIFY) -quiet-warnings $< -o $@
+
+%amd: $(BUILD_DIR)/hip/%.cu amd_headers
 	$(HIPCC) $(HIPCC_FLAGS) $(PFLAGS) $< $(HIPCC_LDFLAGS) -o $@
 
-profile_gpt2amd: profile_gpt2.hip train_gpt2.hip amd_support.h
+profile_gpt2amd: $(BUILD_DIR)/hip/profile_gpt2.cu $(BUILD_DIR)/hip/train_gpt2.cu amd_headers
 	$(HIPCC) $(HIPCC_FLAGS) $(PFLAGS) $< $(HIPCC_LDFLAGS) -o $@
 
-test_gpt2amd: test_gpt2.hip train_gpt2.hip amd_support.h
-	$(HIPCC) $(HIPCC_FLAGS) $(PFLAGS) $< $(HIPCC_LDFLAGS) -o $@
-
-test_gpt2_fp32amd: test_gpt2_fp32.hip train_gpt2_fp32.hip amd_support.h
+test_gpt2amd: $(BUILD_DIR)/hip/test_gpt2.cu $(BUILD_DIR)/hip/train_gpt2.cu amd_headers
 	$(HIPCC) $(HIPCC_FLAGS) $(PFLAGS) $< $(HIPCC_LDFLAGS) -o $@
 
 clean:
-	$(REMOVE_FILES) $(TARGETS) $(NVCC_CUDNN)
+	$(REMOVE_FILES) $(TARGETS) 
+	$(REMOVE_BUILD_OBJECT_FILES)
+	rm -rf $(BUILD_DIR)/hip
