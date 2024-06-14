@@ -64,7 +64,12 @@ HIPCC := $(shell which hipcc 2>/dev/null)
 HIPIFY := $(shell which hipify-perl 2>/dev/null)
 HIPCC_FLAGS = -O3 -march=native -I$(BUILD_DIR)/hip
 HIPCC_FLAGS += $(addprefix --offload-arch=,$(AMDGPU_TARGETS))
-HIPCC_LDFLAGS = -lhipblas -lhipblaslt -lamdhip64 -ldevice_gemm_operations -lutility -ldevice_other_operations
+HIPCC_LDFLAGS = -lhipblas -lhipblaslt -lamdhip64
+ifneq ($(filter gfx1100,$(AMDGPU_TARGETS)),)
+  HIPCC_LDFLAGS += -ldevice_gemm_operations -lutility -ldevice_other_operations
+else
+  HIPCC_FLAGS += -DDISABLE_CK
+endif
 ifneq ($(NO_MULTI_GPU), 1)
   ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
     HIPCC_FLAGS += -I/usr/lib/x86_64-linux-gnu/openmpi/include -DMULTI_GPU

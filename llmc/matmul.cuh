@@ -106,7 +106,7 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,
                      int B, int T, int C, int OC, cudaStream_t stream) {
-#ifdef BUILD_AMD
+#if defined(BUILD_AMD) && !defined(DISABLE_CK)
     return matmul_forward_gfx11(out, inp, weight, bias, B, T, C, OC, stream);
 #endif
     NVTX_RANGE_FN();
