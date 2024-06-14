@@ -23,7 +23,7 @@ Install ROCm 6.1.1, checkout the repo, and perform the following steps:
 
 ```
 pip install -r requirements.txt
-python prepro_tinyshakespeare.py
+python dev/data/tinyshakespeare.py
 python train_gpt2.py
 make train_gpt2amd
 ./train_gpt2amd
@@ -46,6 +46,8 @@ LLMs in simple, pure C/CUDA with no need for 245MB of PyTorch or 107MB of cPytho
 ## quick start
 
 The best introduction to the llm.c repo today is reproducing the GPT-2 (124M) model. [Discussion #481](https://github.com/karpathy/llm.c/discussions/481) steps through this in detail. We can reproduce other models from the GPT-2 and GPT-3 series in both llm.c and in the parallel implementation of PyTorch. Have a look at the [scripts README](scripts/README.md).
+
+debugging tip: when you run the `make` command to build the binary, modify it by replacing `-O3` with `-g` so you can step through the code in your favorite IDE (e.g. vscode).
 
 ## quick start (1 GPU, fp32 only)
 
