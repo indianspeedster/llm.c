@@ -222,6 +222,7 @@ static inline void matmul_forward_gfx11(hip_bfloat16* out,
 #define nvtxNameCudaStreamA(x,y) {}
 #define cublasSetWorkspace(x,y,z) HIPBLAS_STATUS_SUCCESS
 #define nvtxNameCudaEventA(x,y) {}
+#define cudaStreamWaitEvent(x,y) hipStreamWaitEvent(x,y,0)
 
 static __device__ __forceinline__ hip_bfloat16 __float2bfloat16_rn(float f) {
     return hip_bfloat16::round_to_bfloat16(f);
