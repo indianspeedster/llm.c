@@ -1,7 +1,6 @@
 /*
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
-
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +20,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/dataloader.h"
 // defines: manual_seed, normal_ (same as torch.manual_seed and torch.normal)
 #include "llmc/rand.h"
+// defines: lr_scheduler_init, get_learning_rate
+#include "llmc/schedulers.h"
 // defines: sample_softmax, random_f32
 #include "llmc/sampler.h"
 // defines: logger_init, logger_log_eval, logger_log_val, logger_log_train
@@ -70,6 +71,8 @@ cudaDeviceProp deviceProp; // fills in common_start()
 cudaStream_t main_stream;
 // one global variable to hold the multi-GPU configuration for this process
 MultiGpuConfig multi_gpu_config;
+// buffer size to use for device <-> disk io
+constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 
 // convenience function that only prints if the rank of process is zero
 void printf0(const char *format, ...) {
@@ -94,7 +97,6 @@ void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t t
             multi_gpu_config->zero_stage = 0;
         }
         else {
-            printf0("| Zero Stage1 is enabled                                                     |\n");
             multi_gpu_config->zero_stage = 1;
             multi_gpu_config->shard_num_parameters = total_parameters / multi_gpu_config->num_processes;
         }
@@ -354,6 +356,7 @@ void gpt2_init_common(GPT2 *model) {
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
+    model->params_memory = NULL;
     // memory lazily initialized in backward()
     model->grads_memory = NULL;
     model->workload_indices = NULL; // on cpu, for encoder_backward
@@ -363,7 +366,7 @@ void gpt2_init_common(GPT2 *model) {
     model->v_memory = NULL;
     model->master_weights = NULL;
     // other default settings
-    model->rng_state = 13371337; // used in stochastic rounding
+    model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
     model->recompute = 1; // good default: recompute gelu but not layernorm
 }
@@ -384,12 +387,10 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[5] = model->config.num_heads;
     model_header[6] = model->config.channels;
     model_header[7] = model->config.padded_vocab_size;
-    fwrite(model_header, sizeof(int), 256, model_file);
+    fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
-    void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
-    cudaCheck(cudaMemcpy(params_memory_cpu, model->params_memory, model->num_parameters_bytes, cudaMemcpyDeviceToHost));
-    fwrite(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
-    free(params_memory_cpu);
+    device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
+                   IO_BUF_SIZE, main_stream);
     // close file, we're done
     fcloseCheck(model_file);
 }
@@ -448,16 +449,14 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     }
 
     // create memory for model parameters on the device
+    assert(model->params_memory == nullptr && "Old model needs to be freed before loading from checkpoint again");
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
     // read in all the parameters from file and copy them to device
-    void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
-    freadCheck(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
-    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
-    free(params_memory_cpu);
+    file_to_device(model->params_memory, model_file, model->num_parameters_bytes,
+                   IO_BUF_SIZE, main_stream);
     fcloseCheck(model_file);
 
-    gpt2_init_common(model);
     // only return from this function once we are certain the params are ready on the GPU
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -547,8 +546,6 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     // copy them to GPU
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
-
-    gpt2_init_common(model);
 }
 
 void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, size_t T, int grad_accum_steps=1) {
@@ -725,7 +722,7 @@ void gpt2_zero_grad(GPT2 *model) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
+void gpt2_backward_and_reduce(GPT2 *model, int* inputs, bool last_step) {
     NVTX_RANGE_FN();
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
@@ -899,12 +896,15 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
 }
 
 // Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
-float multi_gpu_cpu_float_sum(float value) {
+float multi_gpu_cpu_float_sum(float value, MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
-    // note MPI doesn't support all reduce with mean, only sum
-    float result;
-    mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
-    return result;
+    if (multi_gpu_config->num_processes == 1) return value;
+
+    float* unified_buffer = multi_gpu_config->unified_buffer;
+    *unified_buffer = value;
+    ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
+    cudaCheck(cudaDeviceSynchronize());
+    return *unified_buffer;
 #else
     return value;
 #endif
@@ -918,7 +918,7 @@ void gpt2_multi_gpu_loss_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     // If there's only one process, there is nothing to do
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
-    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
+    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss, multi_gpu_config) / multi_gpu_config->num_processes;
 #endif
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -974,32 +974,34 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     float* grad_norm_squared = (float*)model->acts.output;
     float grad_norm_squared_cpu = 0.0f;
 
+    int num_slices[2] = {1, model->config.num_layers};
+    int max_num_block_sums = get_max_num_block_sums(num_slices, 2);
     if (multi_gpu_config->zero_stage == 1) {
         // because of the ncclReduceScatter() in backward,
         // grads_memory only contains the averaged gradients at the local shards,
         // so we only calculate the grad norm at the grads_memory belonging to the local shards
-        cudaCheck(cudaMemsetAsync(grad_norm_squared, 0, sizeof(float), main_stream));
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
+            ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
+            ptrdiff_t offset = tensor.offset + shard.offset;
+            bool is_first_pass = (i == 0);
             if((i < 2 || i > 13)) {
-                ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
-                ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
-                ptrdiff_t offset = tensor.offset + shard.offset;
-                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1, false, main_stream);
+                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1,
+                                    max_num_block_sums, is_first_pass, main_stream);
             } else {
-                ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
-                ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
-                ptrdiff_t offset = tensor.offset + shard.offset;
                 global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, tensor.size, model->config.num_layers,
-                                    false, main_stream);
+                                    max_num_block_sums, is_first_pass, main_stream);
             }
         }
+        global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
-        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
+        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu, multi_gpu_config);
     } else {
         // in regular DDP, backward has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
-        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, true, main_stream);
+        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, max_num_block_sums, true, main_stream);
+        global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
     }
 
@@ -1013,10 +1015,12 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     float grad_scale = (grad_norm_cpu > grad_clip) ? grad_clip / grad_norm_cpu : 1.0f;
 
     // AdamW update
-    unsigned int seed = random_u32(&model->rng_state);
 
     // handle adamw for all the transformer blocks
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        // generate a unique seed for each tensor
+        unsigned int seed = random_u32(&model->rng_state);
+
         int num_layers = model->config.num_layers;
         if((i < 2 || i > 13)) {
             num_layers = 1;
@@ -1041,7 +1045,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         float* master_ptr = NULL;
         if (model->master_weights != NULL) { master_ptr = model->master_weights + opt_state_offset; }
         if(init_master_weights) {
-            size_t grid_size = CEIL_DIV(shard_num_parameters, 512);
+            size_t grid_size = CEIL_DIV(shard.size, 512);
             copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size,
                                                                      shard.size, tensor.size);
             cudaCheck(cudaGetLastError());
@@ -1104,14 +1108,14 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
 }
 
 void gpt2_free(GPT2 *model) {
-    cudaCheck(cudaFree(model->params_memory));
-    cudaCheck(cudaFree(model->grads_memory));
-    cudaCheck(cudaFree(model->m_memory));
-    cudaCheck(cudaFree(model->v_memory));
-    cudaCheck(cudaFree(model->master_weights));
-    cudaCheck(cudaFree(model->acts_memory));
-    cudaCheck(cudaFree(model->inputs));
-    cudaCheck(cudaFree(model->targets));
+    cudaFreeCheck(&model->params_memory);
+    cudaFreeCheck(&model->grads_memory);
+    cudaFreeCheck(&model->m_memory);
+    cudaFreeCheck(&model->v_memory);
+    cudaFreeCheck(&model->master_weights);
+    cudaFreeCheck(&model->acts_memory);
+    cudaFreeCheck(&model->inputs);
+    cudaFreeCheck(&model->targets);
     cudaCheck(cudaFreeHost(model->cpu_losses));
     cudaCheck(cudaFreeHost(model->cpu_losses_fp32));
     free(model->workload_indices);
@@ -1159,13 +1163,6 @@ void common_free(GPT2 &model) {
     #endif
 }
 
-#ifndef TESTING
-// if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
-
-// ----------------------------------------------------------------------------
-// training resumption logic, very useful when jobs crash once in a while
-// the goal is that we can resume optimization from any checkpoint, bit-perfect
-// note that "state" refers to things not already saved in the model checkpoint file
 
 void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
     printf("Writing state to %s\n", filename);
@@ -1177,23 +1174,34 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     state_header[1] = 1; // version number
     state_header[2] = multi_gpu_config.num_processes; // number of processes
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
+    state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
+    state_header[5] = loader->should_shuffle; // shuffle state of the dataloader
     // int main state, start at 10 to leave some padding
     state_header[10] = step; // step of the optimization
-    // model state, state, start at 20 to leave some padding
+    // model rng state, start at 20 to leave some padding
     *((unsigned long long*)&state_header[20]) = model->rng_state; // random number generator state
     // dataloader state, start at 30 to leave some padding
-    state_header[30] = loader->current_shard; // shard of the dataset
-    *((int64_t*)&state_header[31]) = loader->current_position; // position in shard
-    fwrite(state_header, sizeof(int), 256, state_file);
+    *((size_t*)&state_header[30]) = loader->current_shard_idx; // shard of the dataset
+    *((size_t*)&state_header[32]) = loader->current_sample_idx; // position in shard
+    fwriteCheck(state_header, sizeof(int), 256, state_file);
+
     // write AdamW m, v, and master_weights here (they are all float)
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
-    float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
-    cudaCheck(cudaMemcpy(cpu_buffer, model->m_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
-    fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    cudaCheck(cudaMemcpy(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
-    fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    free(cpu_buffer);
-    fclose(state_file);
+    device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    if(model->use_master_weights) {
+        device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    }
+
+    // write dataloader state if we are using the Permuted version of it
+    if (loader->should_shuffle) {
+        fwriteCheck(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);  // number of shards
+        fwriteCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
+        fwriteCheck(&loader->shard_num_samples, sizeof(size_t), 1, state_file);
+        fwriteCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+        fwriteCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
+    }
+    fcloseCheck(state_file);
 }
 
 void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename) {
@@ -1204,32 +1212,78 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[1] == 1); // version number
     assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
+    int use_master_weights = state_header[4];  // whether we're using fp32 master weights
+    int should_shuffle = state_header[5]; // shuffle state of the dataloader
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
-    int current_shard = state_header[30]; // shard of the dataset
-    int64_t current_position = *((int64_t*)&state_header[31]); // position in shard
-    dataloader_resume(loader, current_shard, current_position);
-    // read AdamW m, v (they are all float)
-    // also allocate the m, v memory in the model, if it does not yet exist
+    size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
+    size_t current_sample_idx = *((size_t*)&state_header[32]); // position in shard
+
+    // read AdamW m, v, master_weights (they are all float)
+    // allocate all the needed memory as necessary
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
     if (model->m_memory == NULL) {
         printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
-        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
+    }
+    if (model->v_memory == NULL) {
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
     }
-    float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
-    freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    cudaCheck(cudaMemcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
-    freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
-    free(cpu_buffer);
-    fclose(state_file);
+    if(use_master_weights == 1 && !model->use_master_weights) {
+        printf0("Warning: Master weights are present in state, but not enabled for current run.");
+    } else if (use_master_weights == 0 && model->use_master_weights) {
+        printf0("Error: Master weights requested, but not present in state file.");
+        exit(EXIT_FAILURE);
+    }
+    if (model->master_weights == NULL && use_master_weights == 1) {
+        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
+    }
+    file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    if(model->use_master_weights) {
+        file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    }
+
+    // revive the DataLoader object and its state
+    loader->should_shuffle = should_shuffle;
+    if (should_shuffle == 1) {
+        // ensure the number of shards matches
+        size_t glob_result_gl_pathc;
+        freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
+        assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
+        // read the shard indices
+        loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
+        freadCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
+        // ensure the number of samples matches
+        size_t shard_num_samples;
+        freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file);
+        assert(shard_num_samples == loader->shard_num_samples);
+        // read the intra-shard indices
+        loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
+        freadCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+        // read the shuffle rng state
+        freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
+    }
+    dataloader_resume(loader, current_shard_idx, current_sample_idx);
+
+    // all done, close state file
+    fcloseCheck(state_file);
 }
+
+
+#ifndef TESTING
+// if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
+
+// ----------------------------------------------------------------------------
+// training resumption logic, very useful when jobs crash once in a while
+// the goal is that we can resume optimization from any checkpoint, bit-perfect
+// note that "state" refers to things not already saved in the model checkpoint file
 
 // ----------------------------------------------------------------------------
 // CLI, poor man's argparse
-// unclaimed flags lol: k,p
+// unclaimed flags lol: p
 
 void error_usage() {
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
@@ -1248,6 +1302,7 @@ void error_usage() {
     // workload (number of steps)
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
     // optimization
+    fprintf(stderr, "  -k <string> learning rate scheduler (default = cosine)\n");
     fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
     fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
     fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
@@ -1266,18 +1321,24 @@ void error_usage() {
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
+    // multi-node settings
+    fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
+    fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
+    fprintf(stderr, "  -pg <int>    gpus_per_node (default = 8)\n");
+    fprintf(stderr, "  -pm <string> nccl_init_method: tcp,fs,mpi (default = mpi)\n");
+    fprintf(stderr, "  -ps <string> server_ip - used only when nccl_init_method is tcp (default = -1)\n");
+    fprintf(stderr, "  -pp <string> fs_path - used only when nccl_init_method is fs (default = /tmp)\n");
     exit(EXIT_FAILURE);
 }
 
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
-
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
+    const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write optimization checkpoints every how many steps?
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
@@ -1299,10 +1360,17 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    // multi-node settings
+    int num_processes = 1;  // this should be set by the slurm environment
+    int process_rank = 0;  // this should be set by the slurm environment
+    int gpus_per_node = 8;  // this should be set by the slurm environment
+    char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
+    char server_ip[256] = "";  // used if init_method set to "tcp" -> set to your server ip address
+    char fs_path[256] = "";  // used if init_method set to "fs" -> set to a shared filesystem path
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
-        if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
+        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
         // read in the args
         if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
@@ -1328,18 +1396,21 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 's') { strcpy(server_ip, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'n') { num_processes = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'r') { process_rank = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'g') { gpus_per_node = atoi(argv[i+1]); }
         else { error_usage(); }
     }
+    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
+
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);
     if (output_log_dir != NULL) {
         assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
-    }
-    // check if output_log_dir does not exist or is a file
-    struct stat info;
-    if (output_log_dir != NULL && (stat(output_log_dir, &info ) != 0 || !(info.st_mode & S_IFDIR))) {
-        fprintf(stderr, "-o \"%s\" does not exist or is a file - are you specifying a file instead of dir?\n", output_log_dir);
-        exit(EXIT_FAILURE);
     }
     int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
     // calculate sensible default for total batch size as assuming no gradient accumulation
@@ -1361,6 +1432,7 @@ int main(int argc, char *argv[]) {
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
+    printf0("| LR scheduler          | %-50s |\n", lr_scheduler_type);
     printf0("| learning rate (LR)    | %-50e |\n", learning_rate);
     printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
     printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
@@ -1400,6 +1472,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model
     GPT2 model;
+    gpt2_init_common(&model);
     // if load_filename is of the form "dX" where X is an integer (e.g. d12), then we build
     // a random model with the depth of the model specified by X (e.g. 12). otherwise interpret
     // this variable as a checkpoint filename, and load that checkpoint
@@ -1431,8 +1504,8 @@ int main(int argc, char *argv[]) {
 
     // build DataLoaders for both train and val
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
-    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 1);
+    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
     // figure out the number of training steps we will run for
     int train_num_batches = max_steps; // passed in from command line
     if (train_num_batches == -1) {
@@ -1492,6 +1565,11 @@ int main(int argc, char *argv[]) {
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
+    // set up learning rate scheduler
+    LearningRateScheduler lr_scheduler;
+    lr_scheduler_init(&lr_scheduler, lr_scheduler_type, learning_rate,
+                      warmup_iterations, train_num_batches, final_learning_rate_frac);
+
     // some memory for generating samples from the model
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     floatX* cpu_logits_raw = (floatX*)mallocCheck(model.config.vocab_size * sizeof(floatX));
@@ -1527,7 +1605,7 @@ int main(int argc, char *argv[]) {
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
-            val_loss = multi_gpu_cpu_float_sum(val_loss) / multi_gpu_config.num_processes;
+            val_loss = multi_gpu_cpu_float_sum(val_loss, &multi_gpu_config) / multi_gpu_config.num_processes;
             printf0("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
         }
@@ -1546,7 +1624,7 @@ int main(int argc, char *argv[]) {
                 eval_acc_norm += (float)correct;
             }
             // careful because not all ranks may have the exact same allocation of number of examples
-            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
+            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm, &multi_gpu_config);
             printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
             logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
         }
@@ -1643,25 +1721,15 @@ int main(int argc, char *argv[]) {
             gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, grad_accum_steps);
             lossf += model.mean_loss; // the mean_loss was normalized by grad_accum_steps inside gpt2_forward
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward(&model, train_loader.inputs, micro_step == grad_accum_steps - 1);
+            gpt2_backward_and_reduce(&model, train_loader.inputs, micro_step == grad_accum_steps - 1);
         }
         // override the mean loss, accounting for the gradient accumulation loop
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
         model.mean_loss = lossf;
         // average the loss and the gradients between all processes
         gpt2_multi_gpu_loss_reduce(&model, &multi_gpu_config);
-        // learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
-        float step_learning_rate = learning_rate;
-        if (step < warmup_iterations) {
-            step_learning_rate = learning_rate * ((float)(step + 1)) / warmup_iterations;
-        } else {
-            float decay_ratio = ((float)(step - warmup_iterations)) / (train_num_batches - warmup_iterations);
-            assert(0.0f <= decay_ratio && decay_ratio <= 1.0f);
-            float coeff = 0.5f * (1.0f + cosf(M_PI * decay_ratio)); // coeff starts at 1 and goes to 0
-            assert(0.0f <= coeff && coeff <= 1.0f);
-            float min_lr = learning_rate * final_learning_rate_frac;
-            step_learning_rate = min_lr + coeff * (learning_rate - min_lr);
-        }
+        // fetch the next learning rate
+        float step_learning_rate = get_learning_rate(&lr_scheduler, step);
         // update the model parameters
         float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
         // zero out the gradients for the next iteration

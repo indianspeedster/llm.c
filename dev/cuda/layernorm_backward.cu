@@ -875,7 +875,6 @@ __global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX
         }
         __builtin_trap();       // prefer to crash here than run into a deadlock later on
     }
-    constexpr int WARP_SIZE = 32;
     int BLOCK_SIZE = blockDim.x;
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
     extern __shared__ float shared[]; // size = 2 * C + 1
@@ -1060,7 +1059,6 @@ layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float*
                             const floatX* dout, const floatX* inp, const floatX* weight,
                             const floatX* mean, const floatX* rstd,
                             int B, int T, int C) {
-    constexpr int WARP_SIZE = 32;
     int BLOCK_SIZE = blockDim.x;
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
     extern __shared__ float shared[]; // size = 2 * C + 1
