@@ -17,12 +17,14 @@ Utilities for ZeRO sharding
 #include <stdio.h>
 #include <stddef.h>
 
-#ifndef BUILD_AMD
 #ifdef MULTI_GPU
+#ifdef BUILD_AMD
+#include <rccl/rccl.h>
+#else
 #include <nccl.h>
+#endif
 #ifdef USE_MPI
 #include <mpi.h>
-#endif
 #endif
 #endif
 
