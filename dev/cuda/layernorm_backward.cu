@@ -16,9 +16,10 @@ version 2 moves a lot of reduction to shared memory over global memory
 #include <cuda_runtime.h>
 #include <assert.h>
 #include <cooperative_groups.h>
+#ifndef BUILD_AMD
 #include <cooperative_groups/reduce.h>
+#endif
 
-#define ENABLE_BF16
 #include "common.h"
 
 // ----------------------------------------------------------------------------
@@ -416,8 +417,8 @@ __global__ void layernorm_backward_kernel4(Tdinp* dinp, Tparams* dweight, Tparam
 
     // write to global memory
     for(int i = threadIdx.x; i < C/2; i+= blockDim.x) {
-        __nv_bfloat162 add_dbias = __halves2bfloat162((__nv_bfloat16)dbias_shared[i*2], (__nv_bfloat16)dbias_shared[i*2+1]);
-        __nv_bfloat162 add_dweight = __halves2bfloat162((__nv_bfloat16)dweight_shared[i*2], (__nv_bfloat16)dweight_shared[i*2+1]);
+        __nv_bfloat162 add_dbias = __halves2bfloat162((__float2bfloat16(dbias_shared[i*2])), __float2bfloat16(dbias_shared[i*2+1]));
+        __nv_bfloat162 add_dweight = __halves2bfloat162(__float2bfloat16(dweight_shared[i*2]), __float2bfloat16(dweight_shared[i*2+1]));
 
         // Get the current value from L2 cache
         __nv_bfloat162 current_dbias = __ldcg(&dbiasVec2[i]);
@@ -872,7 +873,7 @@ __global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX
         if(threadIdx.x == 0 && blockIdx.x == 0) {
             printf("Number of channels is not a multiple of 32 * x128::size");
         }
-        __trap();       // prefer to crash here than run into a deadlock later on
+        __builtin_trap();       // prefer to crash here than run into a deadlock later on
     }
     constexpr int WARP_SIZE = 32;
     int BLOCK_SIZE = blockDim.x;

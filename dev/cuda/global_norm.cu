@@ -10,7 +10,9 @@ nvcc -O3 --use_fast_math global_norm.cu -o global_norm
 
 #include <assert.h>
 #include <cooperative_groups.h>
+#ifndef BUILD_AMD
 #include <cooperative_groups/reduce.h>
+#endif
 
 // turn on bf16 as default, done up here for now
 #define ENABLE_BF16

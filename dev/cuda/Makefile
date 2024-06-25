@@ -2,67 +2,79 @@
 # Collects all the make commands in one file but each file also
 # has the compile and run commands in the header comments section.
 
-# Find nvcc (NVIDIA CUDA compiler)
-NVCC := $(shell which nvcc 2>/dev/null)
-ifeq ($(NVCC),)
-		$(error nvcc not found.)
+BUILD_DIR = build
+ifeq ($(OS), Windows_NT)
+  $(shell if not exist $(BUILD_DIR) mkdir $(BUILD_DIR))
+  REMOVE_BUILD_OBJECT_FILES := del $(BUILD_DIR)\*.obj
+else
+  $(shell mkdir -p $(BUILD_DIR))
+  REMOVE_BUILD_OBJECT_FILES := rm -f $(BUILD_DIR)/*.o
 endif
 
-# Compiler flags
-CFLAGS = -O3 --use_fast_math
-NVCCFLAGS = -lcublas -lcublasLt -std=c++17
-MPI_PATHS = -I/usr/lib/x86_64-linux-gnu/openmpi/include -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
+# AMD flags
+ROCM_PATH ?= /opt/rocm
+AMDGPU_TARGETS ?= $(shell $(ROCM_PATH)/llvm/bin/amdgpu-offload-arch)
+HIPCC := $(shell which hipcc 2>/dev/null)
+HIPIFY := $(shell which hipify-perl 2>/dev/null)
+HIPCC_FLAGS = -O3 -march=native -I$(BUILD_DIR)
+HIPCC_FLAGS += $(addprefix --offload-arch=,$(AMDGPU_TARGETS))
+HIPCC_LDFLAGS = -lhipblas -lhipblaslt -lamdhip64
 
-# Default rule for our CUDA files
-%: %.cu
-	$(NVCC) $(CFLAGS) $(NVCCFLAGS) $< -o $@
+HIPCC_FLAGS += -I./build/hip
+HIPCC_FLAGS += -I../../build/hip/llmc
+HIPCC_FLAGS += -I../../llmc
+
+HIPCC_FLAGS += -I/opt/rocm/include/hipblas
+ifneq ($(filter gfx1100,$(AMDGPU_TARGETS)),)
+  HIPCC_LDFLAGS += -ldevice_gemm_operations -lutility -ldevice_other_operations
+else
+  HIPCC_FLAGS += -DDISABLE_CK
+endif
+ifdef DISABLE_CK
+  HIPCC_FLAGS += -DDISABLE_CK
+endif
+ifdef WAVEFRONTSIZE64
+  HIPCC_FLAGS += -DWAVEFRONTSIZE64 -mwavefrontsize64
+endif
+ifdef CUMODE
+  HIPCC_FLAGS += -mcumode
+endif
+ifneq ($(NO_MULTI_GPU), 1)
+  ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
+    HIPCC_FLAGS += -I/usr/lib/x86_64-linux-gnu/openmpi/include -DMULTI_GPU
+    HIPCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/ -lmpi -lrccl
+  endif
+endif
+AMD_HEADERS = $(addprefix $(BUILD_DIR)/hip/,$(wildcard *h))
+
+# Conditional inclusion of AMD targets
+ifeq ($(HIPCC),)
+    $(error ✗ hipcc not found, stopping GPU/AMD builds)
+else
+    $(info ✓ hipcc found, including GPU/AMD builds)
+    HIPCC_FLAGS += -DBUILD_AMD
+endif
+
+
 
 # Build all targets
-TARGETS = adamw attention_backward attention_forward classifier_fused crossentropy_forward crossentropy_softmax_backward encoder_backward encoder_forward gelu_backward gelu_forward layernorm_backward layernorm_forward matmul_backward matmul_backward_bias matmul_forward nccl_all_reduce residual_forward softmax_forward trimat_forward fused_residual_forward  global_norm
+TARGETS = adamwamd attention_backwardamd attention_forwardamd classifier_fusedamd crossentropy_forwardamd crossentropy_softmax_backwardamd encoder_backwardamd encoder_forwardamd gelu_backwardamd gelu_forwardamd layernorm_backwardamd layernorm_forwardamd matmul_backwardamd matmul_backward_biasamd matmul_forwardamd nccl_all_reduceamd residual_forwardamd softmax_forwardamd trimat_forwardamd fused_residual_forwardamd global_normamd
 all: $(TARGETS)
 
-# Individual targets: forward pass
-attention_forward: attention_forward.cu
-classifier_fused: classifier_fused.cu
-crossentropy_forward: crossentropy_forward.cu
-encoder_forward: encoder_forward.cu
-gelu_forward: gelu_forward.cu
-layernorm_forward: layernorm_forward.cu
-fused_residual_forward: fused_residual_forward.cu
-residual_forward: residual_forward.cu
-softmax_forward: softmax_forward.cu
-trimat_forward: trimat_forward.cu
-# matmul fwd/bwd also uses OpenMP (optionally) and cuBLASLt libs
-matmul_forward: matmul_forward.cu
-	$(NVCC) $(CFLAGS) $(NVCCFLAGS) -Xcompiler -fopenmp matmul_forward.cu -o matmul_forward
 
-# Individual targets: backward pass
-attention_backward: attention_backward.cu
-crossentropy_softmax_backward: crossentropy_softmax_backward.cu
-encoder_backward: encoder_backward.cu
-gelu_backward: gelu_backward.cu
-layernorm_backward: layernorm_backward.cu
-matmul_backward_bias: matmul_backward_bias.cu
-matmul_backward: matmul_backward.cu
-	$(NVCC) $(CFLAGS) $(NVCCFLAGS) -Xcompiler -fopenmp matmul_backward.cu -o matmul_backward
+$(BUILD_DIR)/hip/%h: %h
+	@mkdir -p $(dir $@)
+	$(HIPIFY) -quiet-warnings $< -o $@
 
-# Update kernels
-adamw: adamw.cu
-global_norm: global_norm.cu
+amd_headers: $(AMD_HEADERS)
 
-# NCCL communication kernels
-nccl_all_reduce: nccl_all_reduce.cu
-	$(NVCC) -lmpi -lnccl $(NVCCFLAGS) $(MPI_PATHS) nccl_all_reduce.cu -o nccl_all_reduce
+$(BUILD_DIR)/hip/%.cu: %.cu
+	@mkdir -p $(dir $@)
+	$(HIPIFY) $< -o $@
 
-# Run all targets
-run_all: all
-	@for target in $(TARGETS); do \
-		echo "\n========================================"; \
-		echo "Running $$target ..."; \
-		echo "========================================\n"; \
-		./$$target; \
-	done
+%amd: $(BUILD_DIR)/hip/%.cu amd_headers
+	$(HIPCC) $(HIPCC_FLAGS) $(PFLAGS) $< $(HIPCC_LDFLAGS) -o $@
 
-# Clean up
+
 clean:
 	rm -f $(TARGETS)

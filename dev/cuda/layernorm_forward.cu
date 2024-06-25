@@ -26,7 +26,9 @@ verstion 5 allocates blocks per row instead of warps per row, same alg as 4 othe
 #include <cuda_runtime.h>
 #include <assert.h>
 #include <cooperative_groups.h>
+#ifndef BUILD_AMD
 #include <cooperative_groups/reduce.h>
+#endif
 #include "common.h"
 
 // ----------------------------------------------------------------------------

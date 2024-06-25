@@ -18,7 +18,9 @@ nvcc -O3 --use_fast_math -lcublas -lcublasLt classifier_fused.cu -o classifier_f
 #include <float.h>
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
+#ifndef BUILD_AMD
 #include <cooperative_groups/reduce.h>
+#endif
 #include "common.h"
 
 // todo - this file does not properly support anything but FP32

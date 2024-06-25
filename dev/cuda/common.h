@@ -1,8 +1,12 @@
 #include <stdlib.h>
 #include <stdio.h>
+#ifdef BUILD_AMD
+#include "amd_common.cuh"
+#else
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#endif
 #include <float.h>
 
 

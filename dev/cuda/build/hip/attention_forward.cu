@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 /*
 Kernels for attention forward pass.
 
@@ -48,13 +49,14 @@ version 11 is kernel 10 skipping FP16/FP32 conversions (full FP16/BF16 network)
 #include <stdlib.h>
 #include <assert.h>
 #include <float.h>
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <cooperative_groups.h>
+#include <hipblas.h>
+#include <hip/hip_runtime.h>
 #ifndef BUILD_AMD
 #include <cuda_bf16.h>
-#include <cooperative_groups/reduce.h>
 #endif
+#include <hip/hip_cooperative_groups.h>
+
+
 #define ENABLE_BF16
 #include "common.h"
 
@@ -65,13 +67,13 @@ static bool first_run_validation = true; // always run e.g. permute on 1st run
 #ifdef ENABLE_CUDNN
 #include <cudnn_frontend.h>
 namespace fe = cudnn_frontend;
-#if CUBLAS_LOWP == CUDA_R_16BF
+#if CUBLAS_LOWP == HIP_R_16BF
 #define CUDNN_16BIT fe::DataType_t::BFLOAT16
 #else
 #define CUDNN_16BIT fe::DataType_t::HALF
 #endif
 
-static cudnnHandle_t cudnn_handle;
+static hipdnnHandle_t cudnn_handle;
 static size_t cudnn_workspace_size = 0; // dynamically allocated as needed (up to 256MiB!)
 static void* cudnn_workspace = NULL;
 
@@ -721,10 +723,10 @@ void attention_forward2(float* out,
     // create some temporary memory
     float* l;
     float* m;
-    cudaCheck(cudaMalloc(&l, B * nh * N * sizeof(float)));
-    cudaCheck(cudaMalloc(&m, B * nh * N * sizeof(float)));
-    cudaCheck(cudaMemset(l, 0, B * nh * N * sizeof(float)));
-    cudaCheck(cudaMemset(m, -10000.0f, B * nh * N * sizeof(float)));
+    cudaCheck(hipMalloc(&l, B * nh * N * sizeof(float)));
+    cudaCheck(hipMalloc(&m, B * nh * N * sizeof(float)));
+    cudaCheck(hipMemset(l, 0, B * nh * N * sizeof(float)));
+    cudaCheck(hipMemset(m, -10000.0f, B * nh * N * sizeof(float)));
 
     // calculate SRAM size needed per block, ensure we have enough shared memory
     int col_tile_size = Bc * d;  // size of Kj, Vj
@@ -734,7 +736,7 @@ void attention_forward2(float* out,
         + (row_tile_size * sizeof(float))  // SRAM size for Qi
         + (Bc * Br * sizeof(float));  // SRAM size for S
     int max_sram_size;
-    cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    hipDeviceGetAttribute(&max_sram_size, hipDeviceAttributeMaxSharedMemoryPerBlock, 0);
     if (sram_size > max_sram_size) {
         printf("Max shared memory: %d, requested shared memory: %d \n", max_sram_size, sram_size);
         printf("SRAM size exceeds maximum shared memory per block\n");
@@ -750,9 +752,9 @@ void attention_forward2(float* out,
     // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, nh, d)
     // so we have to permute the tensor using a kernel with block_size
     float *q, *k, *v;
-    cudaCheck(cudaMalloc(&q, B * T * C * sizeof(float)));
-    cudaCheck(cudaMalloc(&k, B * T * C * sizeof(float)));
-    cudaCheck(cudaMalloc(&v, B * T * C * sizeof(float)));
+    cudaCheck(hipMalloc(&q, B * T * C * sizeof(float)));
+    cudaCheck(hipMalloc(&k, B * T * C * sizeof(float)));
+    cudaCheck(hipMalloc(&v, B * T * C * sizeof(float)));
     int total_threads = B * N * nh * d;
     int num_blocks = ceil_div(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, N, nh, d);
@@ -766,14 +768,14 @@ void attention_forward2(float* out,
 
     // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
     unpermute_kernel<<<num_blocks, block_size>>>(out, q, B, N, nh, d);
-    cudaCheck(cudaMemcpy(out, q, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
+    cudaCheck(hipMemcpy(out, q, B * T * C * sizeof(float), hipMemcpyDeviceToDevice));
 
     // free memory
-    cudaCheck(cudaFree(l));
-    cudaCheck(cudaFree(m));
-    cudaCheck(cudaFree(q));
-    cudaCheck(cudaFree(k));
-    cudaCheck(cudaFree(v));
+    cudaCheck(hipFree(l));
+    cudaCheck(hipFree(m));
+    cudaCheck(hipFree(q));
+    cudaCheck(hipFree(k));
+    cudaCheck(hipFree(v));
 }
 
 void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
@@ -797,8 +799,8 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
-                            CUBLAS_OP_T, CUBLAS_OP_N,
+    cublasCheck(hipblasSgemmStridedBatched(cublas_handle,
+                            HIPBLAS_OP_T, HIPBLAS_OP_N,
                             T, T, HS,
                             &alpha,
                             k, HS, T * HS,
@@ -821,8 +823,8 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
-                            CUBLAS_OP_N, CUBLAS_OP_N,
+    cublasCheck(hipblasSgemmStridedBatched(cublas_handle,
+                            HIPBLAS_OP_N, HIPBLAS_OP_N,
                             HS, T, T,
                             &alpha,
                             v, HS, T * HS,
@@ -859,8 +861,8 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
-                                     CUBLAS_OP_T, CUBLAS_OP_N,
+    cublasCheck(hipblasSgemmStridedBatched(cublas_handle,
+                                     HIPBLAS_OP_T, HIPBLAS_OP_N,
                                      T, T, HS,
                                      &alpha,
                                      k, HS, T * HS,
@@ -877,8 +879,8 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
-                                     CUBLAS_OP_N, CUBLAS_OP_N,
+    cublasCheck(hipblasSgemmStridedBatched(cublas_handle,
+                                     HIPBLAS_OP_N, HIPBLAS_OP_N,
                                      HS, T, T,
                                      &alpha,
                                      v, HS, T * HS,
@@ -1020,18 +1022,18 @@ void attention_forward5(float* out, floatX* vaccum, floatX* qkvr, floatX* preatt
         permute_kernel_lowp<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
     }
 
-    // IMPORTANT: alpha/beta are FP32 for CUBLAS_COMPUTE_32F even if FP16 inputs/outputs
-    // But need FP16 scale for CUBLAS_COMPUTE_16F (no errors otherwise, just garbage results *sigh*)
+    // IMPORTANT: alpha/beta are FP32 for HIPBLAS_COMPUTE_32F even if FP16 inputs/outputs
+    // But need FP16 scale for HIPBLAS_COMPUTE_16F (no errors otherwise, just garbage results *sigh*)
     const float alpha = 1.0f;
     const float beta = 0.0f;
     const floatX alpha_lowp = (floatX)alpha;
     const floatX beta_lowp = (floatX)beta;
-    void* alpha_ptr = CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F ? (void*)&alpha_lowp : (void*)&alpha;
-    void* beta_ptr = CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F ? (void*)&beta_lowp : (void*)&beta;
+    void* alpha_ptr = CUBLAS_LOWP_COMPUTE == HIPBLAS_COMPUTE_16F ? (void*)&alpha_lowp : (void*)&alpha;
+    void* beta_ptr = CUBLAS_LOWP_COMPUTE == HIPBLAS_COMPUTE_16F ? (void*)&beta_lowp : (void*)&beta;
 
     // batched matrix multiply with cuBLAS
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
-                                     CUBLAS_OP_T, CUBLAS_OP_N,
+    cublasCheck(hipblasGemmStridedBatchedEx_v2(cublas_handle,
+                                     HIPBLAS_OP_T, HIPBLAS_OP_N,
                                      T, T, HS,
                                      alpha_ptr,
                                      k, CUBLAS_LOWP, HS, T * HS,
@@ -1040,7 +1042,7 @@ void attention_forward5(float* out, floatX* vaccum, floatX* qkvr, floatX* preatt
                                      preatt, CUBLAS_LOWP, T, T * T,
                                      B * NH,
                                      CUBLAS_LOWP_COMPUTE,
-                                     CUBLAS_GEMM_DEFAULT));
+                                     HIPBLAS_GEMM_DEFAULT));
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0f / sqrtf(HS);
@@ -1050,8 +1052,8 @@ void attention_forward5(float* out, floatX* vaccum, floatX* qkvr, floatX* preatt
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
-                                     CUBLAS_OP_N, CUBLAS_OP_N,
+    cublasCheck(hipblasGemmStridedBatchedEx_v2(cublas_handle,
+                                     HIPBLAS_OP_N, HIPBLAS_OP_N,
                                      HS, T, T,
                                      alpha_ptr,
                                      v, CUBLAS_LOWP, HS, T * HS,
@@ -1060,7 +1062,7 @@ void attention_forward5(float* out, floatX* vaccum, floatX* qkvr, floatX* preatt
                                      vaccum, CUBLAS_LOWP, HS, T * HS,
                                      B * NH,
                                      CUBLAS_LOWP_COMPUTE,
-                                     CUBLAS_GEMM_DEFAULT));
+                                     HIPBLAS_GEMM_DEFAULT));
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -1203,15 +1205,15 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
     // By default, cuDNN uses up to 256MiB of workspace, so we don't want to just allocate the maximum
     if (graph->get_workspace_size() > cudnn_workspace_size) {
         if (cudnn_workspace_size > 0) {
-            cudaCheck(cudaFree(cudnn_workspace));
+            cudaCheck(hipFree(cudnn_workspace));
         }
         cudnn_workspace_size = graph->get_workspace_size();
-        cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
+        cudaCheck(hipMalloc(&cudnn_workspace, cudnn_workspace_size));
     }
 
     // Execute graph
     assert(graph->execute(cudnn_handle, variant_pack, cudnn_workspace).is_good());
-    cudaCheck(cudaGetLastError());
+    cudaCheck(hipGetLastError());
 
     // Optionally convert back from FP16/BF16 to FP32
     if (first_run_validation) {
@@ -1220,7 +1222,7 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
         int num_blocks = total_threads / block_size;
         lowp_to_fp32_kernel<<<num_blocks, block_size>>>(out, out_fp32);
     }
-    cudaCheck(cudaGetLastError());
+    cudaCheck(hipGetLastError());
     first_run_validation = false;
 }
 
@@ -1280,19 +1282,19 @@ int main(int argc, char **argv) {
     int NH = 12;
 
     int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    cudaCheck(hipSetDevice(deviceIdx));
+    hipDeviceProp_t deviceProp;
+    hipGetDeviceProperties(&deviceProp, deviceIdx);
 
     // setup cuBLAS (and cuDNN if needed)
-    cublasCreate(&cublas_handle);
+    hipblasCreate(&cublas_handle);
     int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
     printf("enable_tf32: %d\n", enable_tf32);
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
 
     #ifdef ENABLE_CUDNN
-    checkCudnnErr(cudnnCreate(&cudnn_handle));
+    checkCudnnErr(hipdnnCreate(&cudnn_handle));
     #endif
 
     // create host memory of random numbers
@@ -1310,14 +1312,14 @@ int main(int argc, char **argv) {
     float* d_preatt;
     float* d_att;
     float* d_inp;
-    cudaCheck(cudaMalloc(&d_out, B * T * C * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_stats, B * NH * T * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_vaccum, B * T * C * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_qkvr, B * T * 3 * C * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_preatt, B * NH * T * T * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_att, B * NH * T * T * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_inp, B * T * 3 * C * sizeof(float)));
-    cudaCheck(cudaMemcpy(d_inp, inp, B * T * 3 * C * sizeof(float), cudaMemcpyHostToDevice));
+    cudaCheck(hipMalloc(&d_out, B * T * C * sizeof(float)));
+    cudaCheck(hipMalloc(&d_stats, B * NH * T * sizeof(float)));
+    cudaCheck(hipMalloc(&d_vaccum, B * T * C * sizeof(float)));
+    cudaCheck(hipMalloc(&d_qkvr, B * T * 3 * C * sizeof(float)));
+    cudaCheck(hipMalloc(&d_preatt, B * NH * T * T * sizeof(float)));
+    cudaCheck(hipMalloc(&d_att, B * NH * T * T * sizeof(float)));
+    cudaCheck(hipMalloc(&d_inp, B * T * 3 * C * sizeof(float)));
+    cudaCheck(hipMemcpy(d_inp, inp, B * T * 3 * C * sizeof(float), hipMemcpyHostToDevice));
 
     // read kernel_num from command line
     int kernel_num = 1;
@@ -1372,18 +1374,18 @@ int main(int argc, char **argv) {
     free(preatt);
     free(att);
     free(inp);
-    cudaCheck(cudaFree(d_out));
-    cudaCheck(cudaFree(d_vaccum));
-    cudaCheck(cudaFree(d_qkvr));
-    cudaCheck(cudaFree(d_preatt));
-    cudaCheck(cudaFree(d_att));
-    cudaCheck(cudaFree(d_inp));
-    cublasDestroy(cublas_handle);
+    cudaCheck(hipFree(d_out));
+    cudaCheck(hipFree(d_vaccum));
+    cudaCheck(hipFree(d_qkvr));
+    cudaCheck(hipFree(d_preatt));
+    cudaCheck(hipFree(d_att));
+    cudaCheck(hipFree(d_inp));
+    hipblasDestroy(cublas_handle);
 
     #ifdef ENABLE_CUDNN
-    cudnnDestroy(cudnn_handle);
+    hipdnnDestroy(cudnn_handle);
     if (cudnn_workspace_size > 0) {
-        cudaCheck(cudaFree(cudnn_workspace));
+        cudaCheck(hipFree(cudnn_workspace));
     }
     #endif
 
